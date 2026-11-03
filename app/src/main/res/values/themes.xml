@@ -1,0 +1,4 @@
+<resources>
+
+    <style name="Theme.RestoranMenu" parent="Theme.MaterialComponents.Light" />
+</resources>
