@@ -8,13 +8,13 @@ plugins {
 android {
     namespace = "com.example.restoranmenu"
     compileSdk {
-        version = release(37)
+        version = release(35)
     }
 
     defaultConfig {
         applicationId = "com.example.restoranmenu"
         minSdk = 24
-        targetSdk = 37
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
 
