@@ -333,13 +333,24 @@ private class OfflineMenuCache(
     }
 
     private fun buildResponse(bytes: ByteArray, mime: String): WebResourceResponse {
+        val finalBytes = if (mime.startsWith("text/html")) {
+            val polyfill = "<script>(function(){if(!Object.hasOwn){Object.hasOwn=function(o,p){return o!=null&&Object.prototype.hasOwnProperty.call(o,p);};}if(!String.prototype.replaceAll){String.prototype.replaceAll=function(s,r){if(s instanceof RegExp)return this.replace(s,r);var v=typeof r==='function'?r(String(s)):String(r);return this.split(String(s)).join(v);};}})();</script>"
+            val html = bytes.toString(Charsets.UTF_8)
+            if (!html.contains("Object.hasOwn=function") && html.contains("<head>")) {
+                html.replaceFirst("<head>", "<head>$polyfill").toByteArray(Charsets.UTF_8)
+            } else {
+                bytes
+            }
+        } else {
+            bytes
+        }
         val headers = mapOf(
             "Cache-Control" to "no-store, no-cache, must-revalidate",
             "Pragma" to "no-cache",
             "Expires" to "0",
             "Access-Control-Allow-Origin" to "*"
         )
-        return WebResourceResponse(mime, "UTF-8", 200, "OK", headers, ByteArrayInputStream(bytes))
+        return WebResourceResponse(mime, "UTF-8", 200, "OK", headers, ByteArrayInputStream(finalBytes))
     }
 
     private fun guessMimeType(uri: Uri): String {
