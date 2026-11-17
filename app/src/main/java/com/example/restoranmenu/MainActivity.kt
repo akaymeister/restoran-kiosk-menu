@@ -1,6 +1,7 @@
 package com.example.restoranmenu
 
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
@@ -14,8 +15,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.*
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -48,11 +51,14 @@ import java.security.MessageDigest
 class MainActivity : ComponentActivity() {
 
     private lateinit var prefs: SharedPreferences
+    private var activeWebView: WebView? = null
+    private var userExitedKiosk = false
+    private var promptedPinOnResume = false
 
     companion object {
-        private const val PREFS_NAME = "kiosk_config"
-        private const val KEY_MENU_URL = "menu_url"
-        private const val KEY_ADMIN_PIN = "admin_pin"
+        private const val PREFS_NAME = "kiosk_config_v2"
+        private const val KEY_MENU_URL = "menu_url_v2"
+        private const val KEY_ADMIN_PIN = "admin_pin_v2"
         private const val DEFAULT_URL = "https://www.simitcay.online/tablet.html"
         private const val DEFAULT_PIN = "1234"
     }
@@ -60,8 +66,17 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        setupKioskMode()
+        // Geri tuşuyla uygulamadan çıkışı engelle
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (activeWebView?.canGoBack() == true) {
+                    activeWebView?.goBack()
+                }
+            }
+        })
+
         hideSystemUI()
 
         setContent {
@@ -69,9 +84,20 @@ class MainActivity : ComponentActivity() {
                 KioskScreen(
                     currentUrl = getSavedUrl(),
                     currentPin = getSavedPin(),
-                    onSaveUrl = { newUrl -> saveUrl(newUrl) },
+                    isDeviceOwner = isDeviceOwner(),
+                    onWebViewReady = { activeWebView = it },
+                    onSaveUrl = { newUrl ->
+                        val normalized = normalizeMenuUrl(newUrl)
+                        saveUrl(normalized)
+                        normalized
+                    },
                     onSavePin = { newPin -> savePin(newPin) },
+                    onLockKiosk = {
+                        userExitedKiosk = false
+                        setupKioskMode(forcePinPrompt = true)
+                    },
                     onExitKioskMode = {
+                        userExitedKiosk = true
                         try {
                             stopLockTask()
                         } catch (e: Exception) {
@@ -85,8 +111,18 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        tryStartLockTaskSafely()
         hideSystemUI()
+        if (!userExitedKiosk) {
+            setupKioskMode(forcePinPrompt = !promptedPinOnResume)
+            promptedPinOnResume = true
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            hideSystemUI()
+        }
     }
 
     private fun hideSystemUI() {
@@ -97,7 +133,12 @@ class MainActivity : ComponentActivity() {
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     }
 
-    private fun setupKioskMode() {
+    private fun isDeviceOwner(): Boolean {
+        val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
+        return dpm.isDeviceOwnerApp(packageName)
+    }
+
+    private fun setupKioskMode(forcePinPrompt: Boolean) {
         val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
         val componentName = ComponentName(this, KioskDeviceAdminReceiver::class.java)
 
@@ -105,14 +146,11 @@ class MainActivity : ComponentActivity() {
             dpm.setLockTaskPackages(componentName, arrayOf(packageName))
         }
 
-        tryStartLockTaskSafely()
-    }
-
-    private fun tryStartLockTaskSafely() {
-        val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
-        val permitted = dpm.isDeviceOwnerApp(packageName) ||
+        val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+        val isWhitelisted = dpm.isDeviceOwnerApp(packageName) ||
             (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && dpm.isLockTaskPermitted(packageName))
-        if (permitted) {
+
+        if (am.lockTaskModeState == ActivityManager.LOCK_TASK_MODE_NONE && (isWhitelisted || forcePinPrompt)) {
             try {
                 startLockTask()
             } catch (e: Exception) {
@@ -121,7 +159,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun getSavedUrl(): String = prefs.getString(KEY_MENU_URL, DEFAULT_URL) ?: DEFAULT_URL
+    private fun normalizeMenuUrl(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return DEFAULT_URL
+        val withScheme = if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+            trimmed
+        } else {
+            "https://$trimmed"
+        }
+        val uri = Uri.parse(withScheme)
+        val host = uri.host?.lowercase() ?: ""
+        val path = uri.path ?: ""
+        if (host.endsWith("simitcay.online") &&
+            (path.isEmpty() || path == "/" || path == "/index.html" || path == "/index.php")
+        ) {
+            return DEFAULT_URL
+        }
+        return withScheme
+    }
+
+    private fun getSavedUrl(): String = normalizeMenuUrl(prefs.getString(KEY_MENU_URL, DEFAULT_URL) ?: DEFAULT_URL)
     private fun saveUrl(url: String) = prefs.edit().putString(KEY_MENU_URL, url).apply()
 
     private fun getSavedPin(): String = prefs.getString(KEY_ADMIN_PIN, DEFAULT_PIN) ?: DEFAULT_PIN
@@ -142,8 +199,8 @@ private fun isNetworkAvailable(context: Context): Boolean {
 }
 
 /**
- * Sunucudan "no-store" gelse bile menü HTML, JS, CSS, menu-data.php ve görselleri
- * tabletin yerel hafızasına kaydeder. İnternet kesildiğinde anında önbellekten sunar.
+ * Sunucudan "no-store" gelse bile tablet.html, JS, CSS, menu-data.php ve görselleri
+ * tabletin yerel hafızasına kaydeder. İnternet kesildiğinde otomatik önbellekten sunar.
  */
 private class OfflineMenuCache(
     context: Context,
@@ -151,6 +208,10 @@ private class OfflineMenuCache(
 ) {
     private val cacheDir = File(context.filesDir, "offline_menu_cache").apply { mkdirs() }
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    fun cachedFileCount(): Int {
+        return cacheDir.listFiles { _, name -> name.endsWith(".bin") }?.size ?: 0
+    }
 
     fun hasCachedMenu(url: String): Boolean {
         val uri = Uri.parse(url)
@@ -167,9 +228,7 @@ private class OfflineMenuCache(
         if (!host.endsWith("simitcay.online")) return false
         val path = uri.path?.lowercase() ?: ""
         if (path.endsWith(".mp4") || path.endsWith(".webm")) return false
-        return path == "" ||
-            path == "/" ||
-            path.endsWith(".html") ||
+        return path.endsWith(".html") ||
             path.endsWith(".css") ||
             path.endsWith(".js") ||
             path.endsWith(".png") ||
@@ -186,7 +245,7 @@ private class OfflineMenuCache(
     fun fetchOrServeCached(request: WebResourceRequest, online: Boolean): WebResourceResponse? {
         val uri = request.url ?: return null
         val fullUrl = uri.toString()
-        val pathKey = "https://${uri.host}${uri.path ?: "/"}"
+        val pathKey = "https://${uri.host}${uri.path ?: "/tablet.html"}"
         val exactKey = hashKey(fullUrl)
         val fallbackKey = hashKey(pathKey)
 
@@ -197,7 +256,7 @@ private class OfflineMenuCache(
                     connectTimeout = 3500
                     readTimeout = 7000
                     instanceFollowRedirects = true
-                    setRequestProperty("User-Agent", "RestoranKioskTablet/1.0")
+                    setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36")
                 }
                 if (conn.responseCode in 200..299) {
                     val bytes = conn.inputStream.readBytes()
@@ -250,7 +309,7 @@ private class OfflineMenuCache(
     private fun guessMimeType(uri: Uri): String {
         val path = uri.path?.lowercase() ?: ""
         return when {
-            path.endsWith(".html") || path == "" || path == "/" -> "text/html"
+            path.endsWith(".html") -> "text/html"
             path.endsWith(".css") -> "text/css"
             path.endsWith(".js") || path.contains("menu-data.php") -> "application/javascript"
             path.contains("api.php") -> "application/json"
@@ -273,8 +332,11 @@ private class OfflineMenuCache(
 fun KioskScreen(
     currentUrl: String,
     currentPin: String,
-    onSaveUrl: (String) -> Unit,
+    isDeviceOwner: Boolean,
+    onWebViewReady: (WebView) -> Unit,
+    onSaveUrl: (String) -> String,
     onSavePin: (String) -> Unit,
+    onLockKiosk: () -> Unit,
     onExitKioskMode: () -> Unit
 ) {
     val context = LocalContext.current
@@ -285,11 +347,16 @@ fun KioskScreen(
     var showAdminDialog by remember { mutableStateOf(false) }
     var targetUrl by remember { mutableStateOf(currentUrl) }
     var lastLoadedUrl by remember { mutableStateOf(currentUrl) }
+    var cachedCount by remember { mutableStateOf(0) }
 
     val offlineCache = remember {
         OfflineMenuCache(context) { onlineNow ->
             isOnline = onlineNow
         }
+    }
+
+    LaunchedEffect(Unit) {
+        cachedCount = offlineCache.cachedFileCount()
     }
 
     DisposableEffect(Unit) {
@@ -339,6 +406,7 @@ fun KioskScreen(
             factory = { ctx ->
                 WebView(ctx).apply {
                     webViewRef = this
+                    onWebViewReady(this)
                     layoutParams = ViewGroup.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT
@@ -356,6 +424,23 @@ fun KioskScreen(
 
                     webChromeClient = WebChromeClient()
                     webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            view: WebView?,
+                            request: WebResourceRequest?
+                        ): Boolean {
+                            if (request?.isForMainFrame != true) return false
+                            val uri = request.url ?: return false
+                            val host = uri.host?.lowercase() ?: return true
+                            val path = uri.path?.lowercase() ?: ""
+                            if (host.endsWith("simitcay.online") && path.contains("tablet.html")) {
+                                return false
+                            }
+                            if (host.endsWith("simitcay.online")) {
+                                view?.loadUrl(targetUrl)
+                            }
+                            return true
+                        }
+
                         override fun shouldInterceptRequest(
                             view: WebView?,
                             request: WebResourceRequest?
@@ -390,6 +475,7 @@ fun KioskScreen(
                             ) {
                                 hasLoadedOnce = true
                                 showInitialError = false
+                                cachedCount = offlineCache.cachedFileCount()
                             }
                         }
                     }
@@ -481,6 +567,7 @@ fun KioskScreen(
                 .pointerInput(Unit) {
                     detectTapGestures(
                         onLongPress = {
+                            cachedCount = offlineCache.cachedFileCount()
                             showAdminDialog = true
                         }
                     )
@@ -491,13 +578,19 @@ fun KioskScreen(
             HardenedAdminDialog(
                 currentPin = currentPin,
                 currentUrl = targetUrl,
+                cachedCount = cachedCount,
+                isDeviceOwner = isDeviceOwner,
                 onDismiss = { showAdminDialog = false },
                 onSaveUrl = { newUrl ->
-                    targetUrl = newUrl
-                    onSaveUrl(newUrl)
+                    val normalized = onSaveUrl(newUrl)
+                    targetUrl = normalized
                 },
                 onSavePin = { onSavePin(it) },
                 onReload = { webViewRef?.loadUrl(targetUrl) },
+                onLockKiosk = {
+                    showAdminDialog = false
+                    onLockKiosk()
+                },
                 onExitKiosk = {
                     showAdminDialog = false
                     onExitKioskMode()
@@ -511,10 +604,13 @@ fun KioskScreen(
 fun HardenedAdminDialog(
     currentPin: String,
     currentUrl: String,
+    cachedCount: Int,
+    isDeviceOwner: Boolean,
     onDismiss: () -> Unit,
     onSaveUrl: (String) -> Unit,
     onSavePin: (String) -> Unit,
     onReload: () -> Unit,
+    onLockKiosk: () -> Unit,
     onExitKiosk: () -> Unit
 ) {
     var isAuthenticated by remember { mutableStateOf(false) }
@@ -542,7 +638,26 @@ fun HardenedAdminDialog(
                     )
                 }
             } else {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = if (cachedCount > 0) {
+                            "Çevrimdışı Önbellek: Hazır ($cachedCount dosya yedekli)"
+                        } else {
+                            "Çevrimdışı Önbellek: Henüz yok (Wi-Fi ile 1 kez menüyü açın)"
+                        },
+                        fontSize = 12.sp,
+                        color = if (cachedCount > 0) Color(0xFF15803D) else Color(0xFFB45309),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = if (isDeviceOwner) {
+                            "Tam Kiosk Kilidi (Device Owner): Aktif"
+                        } else {
+                            "Ekran Sabitleme Modu: Tam kilit için ADB Device Owner veya Ekran Sabitlemeyi onaylayın"
+                        },
+                        fontSize = 11.sp,
+                        color = Color.Gray
+                    )
                     OutlinedTextField(
                         value = urlInput,
                         onValueChange = { urlInput = it },
@@ -567,10 +682,13 @@ fun HardenedAdminDialog(
                                 onDismiss()
                             }
                         ) {
-                            Text("Kaydet & Yenile")
+                            Text("Kaydet")
                         }
                         OutlinedButton(onClick = { onReload(); onDismiss() }) {
                             Text("Yenile")
+                        }
+                        OutlinedButton(onClick = onLockKiosk) {
+                            Text("Kilitle")
                         }
                     }
                 }
