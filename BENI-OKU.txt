@@ -1,0 +1,15 @@
+SimitCay Menu - GitHub ve Android Studio Guncelleme Paketi
+=========================================================
+
+Bu ZIP dosyasi asagidaki tum duzeltmeleri icerir:
+- Internet kesilince menunun kapanmamasi (OfflineMenuCache)
+- Uygulama adinin SimitCay Menu yapilmasi (strings.xml)
+- Onayli Simit&Cay logosunun otomatik APK ikonu olmasi (build-apk.yml)
+- Tam ekran tema ve KSP derleme hatasi duzeltmeleri
+
+GITHUB UZERINDEN YUKLEME (TEK SEFERDE):
+1. Bu ZIP dosyasini bir klasore cikartin.
+2. Tarayicidan https://github.com/akaymeister/restoran-kiosk-menu/upload/main sayfasini acin.
+3. Cikan klasordeki "app", ".github", "gradle.properties" dosyalarini sayfaya surukleyip birakin.
+4. Alttaki yesil "Commit changes" butonuna basin.
+5. 2 dakika sonra https://github.com/akaymeister/restoran-kiosk-menu/actions sayfasindan SimitCay-Menu-apk dosyasini indirin.
