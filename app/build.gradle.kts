@@ -10,18 +10,43 @@ android {
         version = release(37)
     }
 
+    val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
+
     defaultConfig {
         applicationId = "com.example.restoranmenu"
         minSdk = 24
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 100 + ciRunNumber
+        versionName = "2.$ciRunNumber"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("kiosk") {
+            val ks = file("kiosk-signing.jks")
+            if (ks.exists()) {
+                storeFile = ks
+                storePassword = "SimitCayKiosk2026"
+                keyAlias = "simitcay"
+                keyPassword = "SimitCayKiosk2026"
+                storeType = "PKCS12"
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            val ks = file("kiosk-signing.jks")
+            if (ks.exists()) {
+                signingConfig = signingConfigs.getByName("kiosk")
+            }
+        }
         release {
+            val ks = file("kiosk-signing.jks")
+            if (ks.exists()) {
+                signingConfig = signingConfigs.getByName("kiosk")
+            }
             optimization {
                 enable = false
             }

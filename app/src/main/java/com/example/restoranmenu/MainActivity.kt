@@ -206,11 +206,19 @@ private class OfflineMenuCache(
     context: Context,
     private val onConnectionStatusChanged: (Boolean) -> Unit
 ) {
+    private val appContext = context.applicationContext
     private val cacheDir = File(context.filesDir, "offline_menu_cache").apply { mkdirs() }
     private val mainHandler = Handler(Looper.getMainLooper())
 
     fun cachedFileCount(): Int {
         return cacheDir.listFiles { _, name -> name.endsWith(".bin") }?.size ?: 0
+    }
+
+    fun clearCache() {
+        try {
+            cacheDir.listFiles()?.forEach { it.delete() }
+        } catch (_: Exception) {
+        }
     }
 
     fun hasCachedMenu(url: String): Boolean {
@@ -231,50 +239,76 @@ private class OfflineMenuCache(
         return path.endsWith(".html") ||
             path.endsWith(".css") ||
             path.endsWith(".js") ||
+            path.endsWith(".json") ||
             path.endsWith(".png") ||
             path.endsWith(".jpg") ||
             path.endsWith(".jpeg") ||
             path.endsWith(".webp") ||
             path.endsWith(".svg") ||
+            path.endsWith(".woff") ||
             path.endsWith(".woff2") ||
+            path.endsWith(".ttf") ||
             path.contains("menu-data.php") ||
             path.contains("site-logo.php") ||
-            (path.contains("api.php") && uri.getQueryParameter("action") == "menu")
+            path.contains("api.php")
     }
 
-    fun fetchOrServeCached(request: WebResourceRequest, online: Boolean): WebResourceResponse? {
+    fun fetchOrServeCached(request: WebResourceRequest): WebResourceResponse? {
         val uri = request.url ?: return null
         val fullUrl = uri.toString()
-        val pathKey = "https://${uri.host}${uri.path ?: "/tablet.html"}"
+        val path = uri.path?.lowercase() ?: ""
+        val action = uri.getQueryParameter("action")
+        val fallbackUrl = if (action != null) {
+            "https://${uri.host ?: "www.simitcay.online"}${uri.path ?: ""}?action=$action"
+        } else {
+            "https://${uri.host ?: "www.simitcay.online"}${uri.path ?: "/tablet.html"}"
+        }
         val exactKey = hashKey(fullUrl)
-        val fallbackKey = hashKey(pathKey)
+        val fallbackKey = hashKey(fallbackUrl)
+        val isCoreMenuRequest = request.isForMainFrame ||
+            path.endsWith("tablet.html") ||
+            path.contains("menu-data.php") ||
+            path.contains("api.php")
+        val onlineNow = isNetworkAvailable(appContext)
 
-        if (online) {
+        if (onlineNow) {
             var conn: HttpURLConnection? = null
             try {
                 conn = (URL(fullUrl).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 3500
-                    readTimeout = 7000
+                    useCaches = false
+                    connectTimeout = 4000
+                    readTimeout = 8000
                     instanceFollowRedirects = true
-                    setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36")
+                    setRequestProperty("Cache-Control", "no-cache, no-store, must-revalidate")
+                    setRequestProperty("Pragma", "no-cache")
+                    setRequestProperty(
+                        "User-Agent",
+                        "Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
+                    )
                 }
                 if (conn.responseCode in 200..299) {
                     val bytes = conn.inputStream.readBytes()
                     val mime = conn.contentType?.substringBefore(";")?.trim()
                         ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
                     save(exactKey, bytes, mime)
-                    if (uri.path?.endsWith("tablet.html") == true || uri.path?.endsWith(".php") == true) {
+                    if (isCoreMenuRequest || path.contains("site-logo.php")) {
                         save(fallbackKey, bytes, mime)
                     }
-                    mainHandler.post { onConnectionStatusChanged(true) }
+                    if (isCoreMenuRequest) {
+                        mainHandler.post { onConnectionStatusChanged(true) }
+                    }
                     return buildResponse(bytes, mime)
+                } else if (isCoreMenuRequest) {
+                    mainHandler.post { onConnectionStatusChanged(false) }
                 }
             } catch (_: Exception) {
-                mainHandler.post { onConnectionStatusChanged(false) }
+                if (isCoreMenuRequest) {
+                    mainHandler.post { onConnectionStatusChanged(false) }
+                }
             } finally {
                 conn?.disconnect()
             }
-        } else {
+        } else if (isCoreMenuRequest) {
             mainHandler.post { onConnectionStatusChanged(false) }
         }
 
@@ -300,7 +334,9 @@ private class OfflineMenuCache(
 
     private fun buildResponse(bytes: ByteArray, mime: String): WebResourceResponse {
         val headers = mapOf(
-            "Cache-Control" to "public, max-age=86400",
+            "Cache-Control" to "no-store, no-cache, must-revalidate",
+            "Pragma" to "no-cache",
+            "Expires" to "0",
             "Access-Control-Allow-Origin" to "*"
         )
         return WebResourceResponse(mime, "UTF-8", 200, "OK", headers, ByteArrayInputStream(bytes))
@@ -342,6 +378,7 @@ fun KioskScreen(
     val context = LocalContext.current
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var isOnline by remember { mutableStateOf(isNetworkAvailable(context)) }
+    var wasDisconnected by remember { mutableStateOf(!isNetworkAvailable(context)) }
     var hasLoadedOnce by remember { mutableStateOf(false) }
     var showInitialError by remember { mutableStateOf(false) }
     var showAdminDialog by remember { mutableStateOf(false) }
@@ -349,9 +386,27 @@ fun KioskScreen(
     var lastLoadedUrl by remember { mutableStateOf(currentUrl) }
     var cachedCount by remember { mutableStateOf(0) }
 
+    val appVersionLabel = remember {
+        try {
+            val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
+            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                pInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                pInfo.versionCode.toLong()
+            }
+            "v${pInfo.versionName ?: "2.0"} (Kod: $code)"
+        } catch (_: Exception) {
+            "v2.0"
+        }
+    }
+
     val offlineCache = remember {
         OfflineMenuCache(context) { onlineNow ->
             isOnline = onlineNow
+            if (!onlineNow) {
+                wasDisconnected = true
+            }
         }
     }
 
@@ -365,16 +420,24 @@ fun KioskScreen(
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 mainHandler.post {
+                    val needsRefresh = wasDisconnected || showInitialError || !hasLoadedOnce
+                    wasDisconnected = false
                     isOnline = true
-                    if (showInitialError || !hasLoadedOnce) {
+                    if (needsRefresh) {
                         showInitialError = false
-                        webViewRef?.loadUrl(targetUrl)
+                        if (!hasLoadedOnce) {
+                            webViewRef?.loadUrl(targetUrl)
+                        } else {
+                            webViewRef?.clearCache(false)
+                            webViewRef?.reload()
+                        }
                     }
                 }
             }
 
             override fun onLost(network: Network) {
                 mainHandler.post {
+                    wasDisconnected = true
                     isOnline = false
                 }
             }
@@ -416,7 +479,7 @@ fun KioskScreen(
                     settings.domStorageEnabled = true
                     settings.databaseEnabled = true
                     settings.mediaPlaybackRequiresUserGesture = false
-                    settings.cacheMode = if (isOnline) WebSettings.LOAD_DEFAULT else WebSettings.LOAD_CACHE_ELSE_NETWORK
+                    settings.cacheMode = WebSettings.LOAD_DEFAULT
                     settings.useWideViewPort = true
                     settings.loadWithOverviewMode = true
                     settings.displayZoomControls = false
@@ -446,7 +509,7 @@ fun KioskScreen(
                             request: WebResourceRequest?
                         ): WebResourceResponse? {
                             if (request != null && offlineCache.shouldIntercept(request)) {
-                                return offlineCache.fetchOrServeCached(request, isNetworkAvailable(ctx))
+                                return offlineCache.fetchOrServeCached(request)
                                     ?: super.shouldInterceptRequest(view, request)
                             }
                             return super.shouldInterceptRequest(view, request)
@@ -484,7 +547,7 @@ fun KioskScreen(
                 }
             },
             update = { view ->
-                view.settings.cacheMode = if (isOnline) WebSettings.LOAD_DEFAULT else WebSettings.LOAD_CACHE_ELSE_NETWORK
+                view.settings.cacheMode = WebSettings.LOAD_DEFAULT
                 if (targetUrl != lastLoadedUrl) {
                     lastLoadedUrl = targetUrl
                     showInitialError = false
@@ -579,6 +642,7 @@ fun KioskScreen(
                 currentPin = currentPin,
                 currentUrl = targetUrl,
                 cachedCount = cachedCount,
+                appVersion = appVersionLabel,
                 isDeviceOwner = isDeviceOwner,
                 onDismiss = { showAdminDialog = false },
                 onSaveUrl = { newUrl ->
@@ -586,7 +650,16 @@ fun KioskScreen(
                     targetUrl = normalized
                 },
                 onSavePin = { onSavePin(it) },
-                onReload = { webViewRef?.loadUrl(targetUrl) },
+                onReload = {
+                    webViewRef?.clearCache(false)
+                    webViewRef?.loadUrl(targetUrl)
+                },
+                onClearCacheAndReload = {
+                    offlineCache.clearCache()
+                    cachedCount = 0
+                    webViewRef?.clearCache(true)
+                    webViewRef?.loadUrl(targetUrl)
+                },
                 onLockKiosk = {
                     showAdminDialog = false
                     onLockKiosk()
@@ -605,11 +678,13 @@ fun HardenedAdminDialog(
     currentPin: String,
     currentUrl: String,
     cachedCount: Int,
+    appVersion: String,
     isDeviceOwner: Boolean,
     onDismiss: () -> Unit,
     onSaveUrl: (String) -> Unit,
     onSavePin: (String) -> Unit,
     onReload: () -> Unit,
+    onClearCacheAndReload: () -> Unit,
     onLockKiosk: () -> Unit,
     onExitKiosk: () -> Unit
 ) {
@@ -638,7 +713,13 @@ fun HardenedAdminDialog(
                     )
                 }
             } else {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "Sürüm: $appVersion",
+                        fontSize = 11.sp,
+                        color = Color(0xFF475569),
+                        fontWeight = FontWeight.Medium
+                    )
                     Text(
                         text = if (cachedCount > 0) {
                             "Çevrimdışı Önbellek: Hazır ($cachedCount dosya yedekli)"
@@ -690,6 +771,15 @@ fun HardenedAdminDialog(
                         OutlinedButton(onClick = onLockKiosk) {
                             Text("Kilitle")
                         }
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            onClearCacheAndReload()
+                            onDismiss()
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Önbelleği Temizle & Yenile")
                     }
                 }
             }

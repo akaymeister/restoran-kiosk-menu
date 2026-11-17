@@ -2,14 +2,17 @@ SimitCay Menu - GitHub ve Android Studio Guncelleme Paketi
 =========================================================
 
 Bu ZIP dosyasi asagidaki tum duzeltmeleri icerir:
-- Internet kesilince menunun kapanmamasi (OfflineMenuCache)
-- Uygulama adinin SimitCay Menu yapilmasi (strings.xml)
-- Onayli Simit&Cay logosunun otomatik APK ikonu olmasi (build-apk.yml)
-- Tam ekran tema ve KSP derleme hatasi duzeltmeleri
+- Canli guncelleme + cevrimdisi koruma (Network-First OfflineMenuCache)
+- Yalnizca tablet.html acilisi ve tam ekran kiosk kilidi
+- Sabit imza dosyasi (app/kiosk-signing.jks) ve otomatik surum artisi
+  (Bu son kurulumdan sonra uygulamayi silmeden uzerine guncelleyebilirsiniz)
+- Uygulama adinin SimitCay Menu ve logosunun onayli logo olmasi
 
 GITHUB UZERINDEN YUKLEME (TEK SEFERDE):
-1. Bu ZIP dosyasini bir klasore cikartin.
-2. Tarayicidan https://github.com/akaymeister/restoran-kiosk-menu/upload/main sayfasini acin.
-3. Cikan klasordeki "app", ".github", "gradle.properties" dosyalarini sayfaya surukleyip birakin.
-4. Alttaki yesil "Commit changes" butonuna basin.
-5. 2 dakika sonra https://github.com/akaymeister/restoran-kiosk-menu/actions sayfasindan SimitCay-Menu-apk dosyasini indirin.
+1. Guvenlik icin GitHub deponuzu Settings -> Danger Zone kismindan Private (Gizli) yapin.
+2. Bu ZIP dosyasini bir klasore cikartin.
+3. Tarayicidan https://github.com/akaymeister/restoran-kiosk-menu/upload/main sayfasini acin.
+4. Cikan klasordeki "app", ".github", "gradle.properties" dosyalarini sayfaya surukleyip birakin.
+5. Alttaki yesil "Commit changes" butonuna basin.
+6. 2 dakika sonra Actions sekmesinden SimitCay-Menu-apk dosyasini indirin.
+7. Eski uygulamayi son kez tabletten kaldirip yeni APK yi kurun; bundan sonraki tum surumleri silmeden uzerine kurabilirsiniz.
