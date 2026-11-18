@@ -4,9 +4,11 @@ import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.PendingIntent
 import android.app.admin.DevicePolicyManager
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.PackageInstaller
 import android.net.ConnectivityManager
@@ -14,18 +16,24 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.http.SslError
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.*
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -35,7 +43,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -44,6 +57,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -85,14 +99,19 @@ class MainActivity : ComponentActivity() {
     private var activeWebView: WebView? = null
     private var userExitedKiosk = false
     private var promptedPinOnResume = false
+    private var lastInteractionElapsedMs by mutableStateOf(SystemClock.elapsedRealtime())
+    private var isScreenSleepingState by mutableStateOf(false)
+    private var swallowWakeGestureUntilUp = false
 
     companion object {
         private const val PREFS_NAME = "kiosk_config_v2"
         private const val KEY_MENU_URL = "menu_url_v2"
         private const val KEY_ADMIN_PIN = "admin_pin_v2"
         private const val KEY_UPDATE_URL = "update_apk_url_v2"
+        private const val KEY_SCREEN_TIMEOUT_SEC = "screen_timeout_sec_v2"
         private const val DEFAULT_URL = "https://www.simitcay.online/tablet.html"
         private const val DEFAULT_PIN = "1234"
+        private const val DEFAULT_SCREEN_TIMEOUT_SEC = 30
         private const val DEFAULT_UPDATE_URL =
             "https://github.com/akaymeister/restoran-kiosk-menu/releases/latest/download/SimitCay-Menu.apk"
     }
@@ -100,7 +119,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        lastInteractionElapsedMs = SystemClock.elapsedRealtime()
+        setScreenSleeping(false)
 
         // Geri tuşuyla uygulamadan çıkışı engelle
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -119,7 +139,13 @@ class MainActivity : ComponentActivity() {
                     currentUrl = getSavedUrl(),
                     currentPin = getSavedPin(),
                     currentUpdateUrl = getSavedUpdateUrl(),
+                    initialScreenTimeoutSec = getSavedScreenTimeoutSec(),
                     isDeviceOwner = isDeviceOwner(),
+                    lastInteractionElapsedMs = lastInteractionElapsedMs,
+                    isScreenSleeping = isScreenSleepingState,
+                    onIdleSleep = { setScreenSleeping(true) },
+                    onWakeFromIdle = { wakeScreenFromIdle() },
+                    onSaveScreenTimeoutSec = { sec -> saveScreenTimeoutSec(sec) },
                     onWebViewReady = { activeWebView = it },
                     onSaveUrl = { newUrl ->
                         val normalized = normalizeMenuUrl(newUrl)
@@ -138,6 +164,7 @@ class MainActivity : ComponentActivity() {
                     },
                     onExitKioskMode = {
                         userExitedKiosk = true
+                        setScreenSleeping(false)
                         try {
                             stopLockTask()
                         } catch (e: Exception) {
@@ -149,8 +176,42 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun dispatchTouchEvent(ev: MotionEvent?): Boolean {
+        if (ev != null) {
+            lastInteractionElapsedMs = SystemClock.elapsedRealtime()
+            if (swallowWakeGestureUntilUp) {
+                if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    swallowWakeGestureUntilUp = false
+                }
+                return true
+            }
+            if (isScreenSleepingState) {
+                if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+                    swallowWakeGestureUntilUp = true
+                    setScreenSleeping(false)
+                }
+                return true
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
+        if (event != null) {
+            lastInteractionElapsedMs = SystemClock.elapsedRealtime()
+            if (isScreenSleepingState) {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    setScreenSleeping(false)
+                }
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     override fun onResume() {
         super.onResume()
+        wakeScreenFromIdle()
         hideSystemUI()
         if (!userExitedKiosk) {
             setupKioskMode(forcePinPrompt = !promptedPinOnResume)
@@ -162,6 +223,34 @@ class MainActivity : ComponentActivity() {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
             hideSystemUI()
+        }
+    }
+
+    private fun setScreenSleeping(sleep: Boolean) {
+        isScreenSleepingState = sleep
+        runOnUiThread {
+            try {
+                val attrs = window.attributes
+                if (sleep) {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    attrs.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_OFF
+                } else {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    attrs.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                }
+                window.attributes = attrs
+                if (!sleep) {
+                    hideSystemUI()
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun wakeScreenFromIdle() {
+        lastInteractionElapsedMs = SystemClock.elapsedRealtime()
+        if (isScreenSleepingState) {
+            setScreenSleeping(false)
         }
     }
 
@@ -230,6 +319,13 @@ class MainActivity : ComponentActivity() {
     private fun getSavedUpdateUrl(): String =
         prefs.getString(KEY_UPDATE_URL, DEFAULT_UPDATE_URL)?.takeIf { it.isNotBlank() } ?: DEFAULT_UPDATE_URL
     private fun saveUpdateUrl(url: String) = prefs.edit().putString(KEY_UPDATE_URL, url).apply()
+
+    private fun getSavedScreenTimeoutSec(): Int =
+        prefs.getInt(KEY_SCREEN_TIMEOUT_SEC, DEFAULT_SCREEN_TIMEOUT_SEC)
+
+    private fun saveScreenTimeoutSec(sec: Int) {
+        prefs.edit().putInt(KEY_SCREEN_TIMEOUT_SEC, sec.coerceAtLeast(0)).apply()
+    }
 }
 
 private fun isNetworkAvailable(context: Context): Boolean {
@@ -758,7 +854,13 @@ fun KioskScreen(
     currentUrl: String,
     currentPin: String,
     currentUpdateUrl: String,
+    initialScreenTimeoutSec: Int,
     isDeviceOwner: Boolean,
+    lastInteractionElapsedMs: Long,
+    isScreenSleeping: Boolean,
+    onIdleSleep: () -> Unit,
+    onWakeFromIdle: () -> Unit,
+    onSaveScreenTimeoutSec: (Int) -> Unit,
     onWebViewReady: (WebView) -> Unit,
     onSaveUrl: (String) -> String,
     onSaveUpdateUrl: (String) -> String,
@@ -777,8 +879,11 @@ fun KioskScreen(
     var showAdminDialog by remember { mutableStateOf(false) }
     var targetUrl by remember { mutableStateOf(currentUrl) }
     var updateApkUrl by remember { mutableStateOf(currentUpdateUrl) }
+    var screenTimeoutSec by remember { mutableStateOf(initialScreenTimeoutSec) }
     var lastLoadedUrl by remember { mutableStateOf(currentUrl) }
     var cachedCount by remember { mutableStateOf(0) }
+    var batteryPercent by remember { mutableStateOf(-1) }
+    var isCharging by remember { mutableStateOf(false) }
 
     val chromeMajor = remember { detectChromeMajor(context) }
 
@@ -816,6 +921,71 @@ fun KioskScreen(
 
     LaunchedEffect(Unit) {
         cachedCount = offlineCache.cachedFileCount()
+    }
+
+    // Batarya seviyesi ve şarj durumunu canlı dinle
+    DisposableEffect(Unit) {
+        try {
+            val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+            val cap = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+            if (cap in 0..100 && batteryPercent < 0) {
+                batteryPercent = cap
+            }
+        } catch (_: Exception) {
+        }
+
+        val batteryFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+        val batteryReceiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context?, intent: Intent?) {
+                if (intent == null) return
+                val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+                if (level >= 0 && scale > 0) {
+                    batteryPercent = ((level * 100f) / scale).toInt().coerceIn(0, 100)
+                }
+                val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                val plugged = intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+                isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    status == BatteryManager.BATTERY_STATUS_FULL ||
+                    plugged != 0
+            }
+        }
+        try {
+            val sticky = ContextCompat.registerReceiver(
+                context,
+                batteryReceiver,
+                batteryFilter,
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            if (sticky != null) {
+                batteryReceiver.onReceive(context, sticky)
+            }
+        } catch (_: Exception) {
+        }
+        onDispose {
+            try {
+                context.unregisterReceiver(batteryReceiver)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // 30 saniye hareketsizlikte ekranı uyku moduna al
+    LaunchedEffect(screenTimeoutSec, showAdminDialog) {
+        if (screenTimeoutSec <= 0) {
+            onWakeFromIdle()
+            return@LaunchedEffect
+        }
+        while (true) {
+            if (!showAdminDialog && !isScreenSleeping) {
+                val elapsedMs = SystemClock.elapsedRealtime() - lastInteractionElapsedMs
+                val timeoutMs = screenTimeoutSec * 1000L
+                if (elapsedMs >= timeoutMs) {
+                    onIdleSleep()
+                }
+            }
+            delay(1000)
+        }
     }
 
     DisposableEffect(Unit) {
@@ -1076,7 +1246,7 @@ fun KioskScreen(
             }
         }
 
-        if (!isOnline && !showInitialError) {
+        if (!isOnline && !showInitialError && !isScreenSleeping) {
             Box(
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -1091,6 +1261,16 @@ fun KioskScreen(
                     fontWeight = FontWeight.Medium
                 )
             }
+        }
+
+        if (!isScreenSleeping && batteryPercent >= 0) {
+            KioskBatteryIndicator(
+                batteryPercent = batteryPercent,
+                isCharging = isCharging,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 8.dp)
+            )
         }
 
         Box(
@@ -1108,15 +1288,37 @@ fun KioskScreen(
                 }
         )
 
+        if (isScreenSleeping) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+                contentAlignment = Alignment.BottomCenter
+            ) {
+                Text(
+                    text = "Ekran uyku modunda • Açmak için dokunun",
+                    color = Color(0xFF334155),
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(bottom = 24.dp)
+                )
+            }
+        }
+
         if (showAdminDialog) {
             HardenedAdminDialog(
                 currentPin = currentPin,
                 currentUrl = targetUrl,
                 currentUpdateUrl = updateApkUrl,
+                currentScreenTimeoutSec = screenTimeoutSec,
+                batteryPercent = batteryPercent,
+                isCharging = isCharging,
                 cachedCount = cachedCount,
                 appVersion = appVersionLabel,
                 isDeviceOwner = isDeviceOwner,
-                onDismiss = { showAdminDialog = false },
+                onDismiss = {
+                    onWakeFromIdle()
+                    showAdminDialog = false
+                },
                 onSaveUrl = { newUrl ->
                     val normalized = onSaveUrl(newUrl)
                     targetUrl = normalized
@@ -1125,6 +1327,10 @@ fun KioskScreen(
                     val clean = onSaveUpdateUrl(newUpdateUrl)
                     updateApkUrl = clean
                     clean
+                },
+                onSaveScreenTimeoutSec = { sec ->
+                    screenTimeoutSec = sec
+                    onSaveScreenTimeoutSec(sec)
                 },
                 onSavePin = { onSavePin(it) },
                 onReload = {
@@ -1147,6 +1353,90 @@ fun KioskScreen(
                 }
             )
         }
+    }
+}
+
+@Composable
+private fun KioskBatteryIndicator(
+    batteryPercent: Int,
+    isCharging: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val accentColor = when {
+        isCharging -> Color(0xFF22C55E)
+        batteryPercent <= 15 -> Color(0xFFEF4444)
+        batteryPercent <= 30 -> Color(0xFFF59E0B)
+        else -> Color(0xFF4ADE80)
+    }
+    val borderColor = when {
+        batteryPercent <= 15 && !isCharging -> Color(0x99EF4444)
+        isCharging -> Color(0x8822C55E)
+        else -> Color(0x33FFFFFF)
+    }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = modifier
+            .background(Color(0xCC091B30), RoundedCornerShape(999.dp))
+            .border(1.dp, borderColor, RoundedCornerShape(999.dp))
+            .padding(horizontal = 10.dp, vertical = 4.dp)
+    ) {
+        Canvas(modifier = Modifier.size(width = 24.dp, height = 12.dp)) {
+            val strokePx = 1.4.dp.toPx()
+            val nubWidth = 2.5.dp.toPx()
+            val bodyWidth = size.width - nubWidth - 1.dp.toPx()
+            val bodyHeight = size.height
+
+            drawRoundRect(
+                color = Color(0xFFE2E8F0),
+                topLeft = Offset(0f, 0f),
+                size = Size(bodyWidth, bodyHeight),
+                cornerRadius = CornerRadius(2.5.dp.toPx(), 2.5.dp.toPx()),
+                style = Stroke(width = strokePx)
+            )
+
+            drawRoundRect(
+                color = Color(0xFFE2E8F0),
+                topLeft = Offset(bodyWidth + 1.dp.toPx(), bodyHeight * 0.28f),
+                size = Size(nubWidth, bodyHeight * 0.44f),
+                cornerRadius = CornerRadius(1.dp.toPx(), 1.dp.toPx())
+            )
+
+            val pad = strokePx + 1.dp.toPx()
+            val maxFillW = (bodyWidth - pad * 2).coerceAtLeast(0f)
+            val fillRatio = (batteryPercent.coerceIn(0, 100) / 100f)
+            val fillW = (maxFillW * fillRatio).coerceAtLeast(if (batteryPercent > 0) 2f else 0f)
+            if (fillW > 0f) {
+                drawRoundRect(
+                    color = accentColor,
+                    topLeft = Offset(pad, pad),
+                    size = Size(fillW, (bodyHeight - pad * 2).coerceAtLeast(0f)),
+                    cornerRadius = CornerRadius(1.2.dp.toPx(), 1.2.dp.toPx())
+                )
+            }
+
+            if (isCharging) {
+                val cx = bodyWidth * 0.5f
+                val bolt = Path().apply {
+                    moveTo(cx + 1.5.dp.toPx(), 1.5.dp.toPx())
+                    lineTo(cx - 2.2.dp.toPx(), bodyHeight * 0.55f)
+                    lineTo(cx + 0.3.dp.toPx(), bodyHeight * 0.55f)
+                    lineTo(cx - 1.5.dp.toPx(), bodyHeight - 1.5.dp.toPx())
+                    lineTo(cx + 2.4.dp.toPx(), bodyHeight * 0.45f)
+                    lineTo(cx - 0.2.dp.toPx(), bodyHeight * 0.45f)
+                    close()
+                }
+                drawPath(path = bolt, color = Color.White)
+            }
+        }
+
+        Text(
+            text = if (isCharging) "%$batteryPercent ⚡" else "%$batteryPercent",
+            color = if (batteryPercent <= 15 && !isCharging) Color(0xFFFCA5A5) else Color(0xFFF8FAFC),
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold
+        )
     }
 }
 
@@ -1264,12 +1554,16 @@ fun HardenedAdminDialog(
     currentPin: String,
     currentUrl: String,
     currentUpdateUrl: String,
+    currentScreenTimeoutSec: Int,
+    batteryPercent: Int,
+    isCharging: Boolean,
     cachedCount: Int,
     appVersion: String,
     isDeviceOwner: Boolean,
     onDismiss: () -> Unit,
     onSaveUrl: (String) -> Unit,
     onSaveUpdateUrl: (String) -> String,
+    onSaveScreenTimeoutSec: (Int) -> Unit,
     onSavePin: (String) -> Unit,
     onReload: () -> Unit,
     onClearCacheAndReload: () -> Unit,
@@ -1283,6 +1577,7 @@ fun HardenedAdminDialog(
     var isError by remember { mutableStateOf(false) }
     var urlInput by remember { mutableStateOf(currentUrl) }
     var updateUrlInput by remember { mutableStateOf(currentUpdateUrl) }
+    var timeoutSecInput by remember { mutableStateOf(currentScreenTimeoutSec) }
     var newPinInput by remember { mutableStateOf("") }
     var isUpdatingApk by remember { mutableStateOf(false) }
     var updateStatus by remember { mutableStateOf<String?>(null) }
@@ -1316,6 +1611,14 @@ fun HardenedAdminDialog(
                         color = Color(0xFF475569),
                         fontWeight = FontWeight.Medium
                     )
+                    if (batteryPercent >= 0) {
+                        Text(
+                            text = if (isCharging) "Pil: %$batteryPercent (Şarj Oluyor ⚡)" else "Pil: %$batteryPercent",
+                            fontSize = 12.sp,
+                            color = if (batteryPercent <= 15 && !isCharging) Color(0xFFDC2626) else Color(0xFF0F766E),
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                     Text(
                         text = if (cachedCount > 0) {
                             "Çevrimdışı Önbellek: Hazır ($cachedCount dosya yedekli)"
@@ -1335,6 +1638,44 @@ fun HardenedAdminDialog(
                         fontSize = 11.sp,
                         color = Color.Gray
                     )
+
+                    Text(
+                        text = "Hareketsizlik Ekran Uyku Süresi:",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF0F172A)
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(
+                            15 to "15 sn",
+                            30 to "30 sn",
+                            60 to "60 sn",
+                            0 to "Açık"
+                        ).forEach { (sec, label) ->
+                            val selected = timeoutSecInput == sec
+                            OutlinedButton(
+                                onClick = {
+                                    timeoutSecInput = sec
+                                    onSaveScreenTimeoutSec(sec)
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                colors = if (selected) {
+                                    ButtonDefaults.outlinedButtonColors(
+                                        containerColor = Color(0xFF092746),
+                                        contentColor = Color.White
+                                    )
+                                } else {
+                                    ButtonDefaults.outlinedButtonColors()
+                                },
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(label, fontSize = 11.sp, maxLines = 1)
+                            }
+                        }
+                    }
 
                     Button(
                         onClick = {
@@ -1406,6 +1747,7 @@ fun HardenedAdminDialog(
                             onClick = {
                                 onSaveUrl(urlInput)
                                 onSaveUpdateUrl(updateUrlInput)
+                                onSaveScreenTimeoutSec(timeoutSecInput)
                                 if (newPinInput.isNotBlank()) onSavePin(newPinInput)
                                 onDismiss()
                             }
