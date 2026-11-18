@@ -55,6 +55,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Dns
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -67,6 +68,7 @@ import java.net.UnknownHostException
 import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.cert.CertificateException
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
@@ -337,18 +339,41 @@ private object KioskTlsHelper {
 
             val ks = KeyStore.getInstance(KeyStore.getDefaultType())
             ks.load(null, null)
-            var idx = 0
-            sysTm?.acceptedIssuers?.forEach { cert ->
-                ks.setCertificateEntry("sys_${idx++}", cert)
-            }
             val cf = CertificateFactory.getInstance("X.509")
-            listOf(SECTIGO_ROOT_R46_PEM, ISRG_ROOT_X1_PEM).forEach { pem ->
+            listOf(SECTIGO_ROOT_R46_PEM, ISRG_ROOT_X1_PEM).forEachIndexed { idx, pem ->
                 val cert = cf.generateCertificate(ByteArrayInputStream(pem.toByteArray(Charsets.UTF_8))) as X509Certificate
-                ks.setCertificateEntry("kiosk_${idx++}", cert)
+                ks.setCertificateEntry("kiosk_$idx", cert)
             }
-            val combinedTmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
-            combinedTmf.init(ks)
-            combinedTmf.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()
+            val extraTmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            extraTmf.init(ks)
+            val extraTm = extraTmf.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()
+
+            object : X509TrustManager {
+                override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {
+                    sysTm?.checkClientTrusted(chain, authType)
+                }
+
+                override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
+                    if (sysTm != null) {
+                        try {
+                            sysTm.checkServerTrusted(chain, authType)
+                            return
+                        } catch (_: CertificateException) {
+                        }
+                    }
+                    if (extraTm != null) {
+                        extraTm.checkServerTrusted(chain, authType)
+                        return
+                    }
+                    throw CertificateException("Güvenilir kök sertifika bulunamadı")
+                }
+
+                override fun getAcceptedIssuers(): Array<X509Certificate> {
+                    val sys = sysTm?.acceptedIssuers ?: emptyArray()
+                    val extra = extraTm?.acceptedIssuers ?: emptyArray()
+                    return sys + extra
+                }
+            }
         } catch (_: Exception) {
             null
         }
@@ -403,6 +428,7 @@ private fun createResilientOkHttpClient(
     readSec: Long = 20
 ): OkHttpClient {
     val builder = OkHttpClient.Builder()
+        .protocols(listOf(Protocol.HTTP_1_1))
         .connectTimeout(connectSec, TimeUnit.SECONDS)
         .readTimeout(readSec, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
@@ -458,21 +484,30 @@ private class OfflineMenuCache(
         }
     }
 
+    fun hasCompleteOfflineBundle(): Boolean {
+        val required = listOf(
+            "https://www.simitcay.online/tablet.html",
+            "https://www.simitcay.online/menu-data.php",
+            "https://www.simitcay.online/menu-ui.js",
+            "https://www.simitcay.online/tablet.js",
+            "https://www.simitcay.online/tablet.css"
+        )
+        return required.all { File(cacheDir, hashKey(it) + ".bin").exists() }
+    }
+
     fun hasCachedMenu(url: String): Boolean {
-        val uri = Uri.parse(url)
-        val pathKey = "https://${uri.host ?: "www.simitcay.online"}${uri.path ?: "/tablet.html"}"
-        return File(cacheDir, hashKey(url) + ".bin").exists() ||
-            File(cacheDir, hashKey(pathKey) + ".bin").exists() ||
-            File(cacheDir, hashKey("https://www.simitcay.online/tablet.html") + ".bin").exists()
+        return hasCompleteOfflineBundle()
     }
 
     fun loadCachedHtml(url: String): String? {
+        if (!hasCompleteOfflineBundle()) return null
         val uri = Uri.parse(url)
         val pathKey = "https://${uri.host ?: "www.simitcay.online"}${uri.path ?: "/tablet.html"}"
         val candidates = listOf(url, pathKey, "https://www.simitcay.online/tablet.html")
         for (candidate in candidates) {
             val f = File(cacheDir, hashKey(candidate) + ".bin")
             if (f.exists()) {
+                lastMainFrameLoaded = true
                 return injectPolyfill(f.readBytes()).toString(Charsets.UTF_8)
             }
         }
@@ -563,7 +598,7 @@ private class OfflineMenuCache(
                             val mime = resp.header("Content-Type")?.substringBefore(";")?.trim()
                                 ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
                             save(exactKey, bytes, mime)
-                            if (isCoreMenuRequest || path.contains("site-logo.php")) {
+                            if (isCoreMenuRequest || path.endsWith(".js") || path.endsWith(".css") || path.contains("site-logo.php")) {
                                 save(fallbackKey, bytes, mime)
                             }
                             if (isCoreMenuRequest) {
@@ -588,7 +623,7 @@ private class OfflineMenuCache(
             mainHandler.post { onConnectionStatusChanged(false) }
         }
 
-        if (cachedBefore != null) {
+        if (cachedBefore != null && (!request.isForMainFrame || hasCompleteOfflineBundle())) {
             if (request.isForMainFrame) {
                 lastMainFrameLoaded = true
             }
@@ -597,7 +632,7 @@ private class OfflineMenuCache(
 
         if (request.isForMainFrame) {
             lastMainFrameLoaded = false
-            val err = lastErrMsg ?: "İnternet bağlantısı yok"
+            val err = lastErrMsg ?: if (!onlineNow) "İnternet bağlantısı yok (Çevrimdışı önbellek henüz tam değil)" else "Sunucuya erişilemedi"
             mainHandler.post { onCoreError(err) }
             val placeholder = "<!doctype html><html><body style='margin:0;background:#092746'></body></html>".toByteArray(Charsets.UTF_8)
             return WebResourceResponse("text/html", "UTF-8", 200, "OK", emptyMap(), ByteArrayInputStream(placeholder))
@@ -624,12 +659,17 @@ private class OfflineMenuCache(
 
     private fun injectPolyfill(bytes: ByteArray): ByteArray {
         val polyfill = "<script>var __oc,__nc;(function(){" +
+            "window.__kioskJsErr='';window.addEventListener('error',function(e){if(!window.__kioskJsErr)window.__kioskJsErr=(e.message||'JS Hatasi')+' ('+(e.filename||'').split('/').pop()+':'+(e.lineno||0)+')';});" +
             "if(!Object.hasOwn){Object.hasOwn=function(o,p){return o!=null&&Object.prototype.hasOwnProperty.call(o,p);};}" +
+            "if(!Object.fromEntries){Object.fromEntries=function(it){var o={};for(var x of it){o[x[0]]=x[1];}return o;};}" +
             "if(!String.prototype.replaceAll){String.prototype.replaceAll=function(s,r){if(s instanceof RegExp)return this.replace(s,r);var v=typeof r==='function'?r(String(s)):String(r);return this.split(String(s)).join(v);};}" +
             "if(!Array.prototype.at){Array.prototype.at=function(n){n=Math.trunc(n)||0;if(n<0)n+=this.length;if(n<0||n>=this.length)return undefined;return this[n];};}" +
+            "if(!Array.prototype.flat){Array.prototype.flat=function(d){var dp=d===undefined?1:Number(d);var fl=function(a,l){var r=[];for(var i=0;i<a.length;i++){if(Array.isArray(a[i])&&l>0){r=r.concat(fl(a[i],l-1));}else{r.push(a[i]);}}return r;};return fl(this,dp);};}" +
+            "if(!Array.prototype.flatMap){Array.prototype.flatMap=function(fn,th){return this.map(fn,th).flat(1);};}" +
             "var rc=function(){while(this.firstChild)this.removeChild(this.firstChild);for(var i=0;i<arguments.length;i++){var n=arguments[i];this.appendChild(typeof n==='string'?document.createTextNode(n):n);}};" +
             "if(typeof Element!=='undefined'&&!Element.prototype.replaceChildren){Element.prototype.replaceChildren=rc;}" +
             "if(typeof DocumentFragment!=='undefined'&&!DocumentFragment.prototype.replaceChildren){DocumentFragment.prototype.replaceChildren=rc;}" +
+            "if(typeof HTMLDialogElement!=='undefined'&&!HTMLDialogElement.prototype.showModal){HTMLDialogElement.prototype.showModal=function(){this.setAttribute('open','');};HTMLDialogElement.prototype.close=function(){this.removeAttribute('open');};}" +
             "try{document.querySelectorAll(':has(*)');}catch(_e){" +
             "var wrapQsa=function(orig){return function(sel){try{return orig.call(this,sel);}catch(err){if(typeof sel==='string'&&sel.indexOf(':has(')!==-1){var parts=sel.split(','),out=[],seen=[];for(var i=0;i<parts.length;i++){var p=parts[i].trim();if(p==='header>a:has(img[data-brand-logo])'){var imgs=this.querySelectorAll('header > a > img[data-brand-logo]');for(var k=0;k<imgs.length;k++){var pa=imgs[k].parentNode;if(pa&&seen.indexOf(pa)===-1){seen.push(pa);out.push(pa);}}}else if(p.indexOf(':has(')===-1){try{var list=orig.call(this,p);for(var j=0;j<list.length;j++){if(seen.indexOf(list[j])===-1){seen.push(list[j]);out.push(list[j]);}}}catch(_x){}}}return out;}return [];}};};" +
             "if(typeof Document!=='undefined')Document.prototype.querySelectorAll=wrapQsa(Document.prototype.querySelectorAll);" +
@@ -733,6 +773,7 @@ fun KioskScreen(
     var hasLoadedOnce by remember { mutableStateOf(false) }
     var showInitialError by remember { mutableStateOf(false) }
     var lastErrorReason by remember { mutableStateOf<String?>(null) }
+    var lastJsError by remember { mutableStateOf<String?>(null) }
     var showAdminDialog by remember { mutableStateOf(false) }
     var targetUrl by remember { mutableStateOf(currentUrl) }
     var updateApkUrl by remember { mutableStateOf(currentUpdateUrl) }
@@ -846,7 +887,15 @@ fun KioskScreen(
                     settings.displayZoomControls = false
                     settings.setSupportZoom(false)
 
-                    webChromeClient = WebChromeClient()
+                    webChromeClient = object : WebChromeClient() {
+                        override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                            if (consoleMessage?.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                                val src = consoleMessage.sourceId()?.substringAfterLast('/') ?: ""
+                                lastJsError = "${consoleMessage.message()} ($src:${consoleMessage.lineNumber()})"
+                            }
+                            return super.onConsoleMessage(consoleMessage)
+                        }
+                    }
                     webViewClient = object : WebViewClient() {
                         override fun shouldOverrideUrlLoading(
                             view: WebView?,
@@ -931,6 +980,18 @@ fun KioskScreen(
                                     hasLoadedOnce = true
                                     showInitialError = false
                                     lastErrorReason = null
+                                    view?.postDelayed({
+                                        view.evaluateJavascript(
+                                            "(function(){var g=document.getElementById('gate'),b=document.getElementById('board'),i=document.getElementById('intro');var ok=(g&&g.children.length>0)||(b&&!b.hidden)||(i&&!i.hidden);return (ok?'OK':'EMPTY')+'|'+(window.__kioskJsErr||'');})()"
+                                        ) { raw ->
+                                            val clean = raw?.trim('"') ?: ""
+                                            if (clean.startsWith("EMPTY")) {
+                                                val jsErr = clean.substringAfter('|', "").ifBlank { lastJsError ?: "Menü scripti yüklenemedi" }
+                                                lastErrorReason = "Sayfa boş kaldı ($jsErr)"
+                                                showInitialError = true
+                                            }
+                                        }
+                                    }, 3500)
                                 }
                                 cachedCount = offlineCache.cachedFileCount()
                             }
@@ -986,6 +1047,13 @@ fun KioskScreen(
                             textAlign = TextAlign.Center
                         )
                     }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = appVersionLabel,
+                        fontSize = 10.sp,
+                        color = Color(0xFF94A3B8),
+                        textAlign = TextAlign.Center
+                    )
                     Spacer(modifier = Modifier.height(24.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Button(
