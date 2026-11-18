@@ -55,12 +55,14 @@ import kotlinx.coroutines.withContext
 import okhttp3.Dns
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.URL
+import java.net.UnknownHostException
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
@@ -227,6 +229,60 @@ private fun isNetworkAvailable(context: Context): Boolean {
     }
 }
 
+private fun resolveViaGoogleDoh(hostname: String): List<InetAddress> {
+    var conn: HttpURLConnection? = null
+    return try {
+        val url = URL("https://8.8.8.8/resolve?name=$hostname&type=A")
+        conn = (url.openConnection() as HttpURLConnection).apply {
+            connectTimeout = 5000
+            readTimeout = 5000
+            setRequestProperty("Accept", "application/dns-json")
+        }
+        if (conn.responseCode !in 200..299) return emptyList()
+        val body = conn.inputStream.bufferedReader().use { it.readText() }
+        val answers = JSONObject(body).optJSONArray("Answer") ?: return emptyList()
+        val result = mutableListOf<InetAddress>()
+        for (i in 0 until answers.length()) {
+            val item = answers.optJSONObject(i) ?: continue
+            if (item.optInt("type") == 1) {
+                val ip = item.optString("data").trim()
+                if (ip.isNotEmpty()) {
+                    result.add(InetAddress.getByName(ip))
+                }
+            }
+        }
+        result
+    } catch (_: Exception) {
+        emptyList()
+    } finally {
+        conn?.disconnect()
+    }
+}
+
+private fun createResilientOkHttpClient(
+    connectSec: Long = 12,
+    readSec: Long = 20
+): OkHttpClient {
+    return OkHttpClient.Builder()
+        .connectTimeout(connectSec, TimeUnit.SECONDS)
+        .readTimeout(readSec, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .dns(object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                return try {
+                    Dns.SYSTEM.lookup(hostname).sortedBy { it !is Inet4Address }
+                } catch (e: UnknownHostException) {
+                    val doh = resolveViaGoogleDoh(hostname)
+                    if (doh.isNotEmpty()) doh else throw e
+                }
+            }
+        })
+        .build()
+}
+
 /**
  * Sunucudan "no-store" gelse bile tablet.html, JS, CSS, menu-data.php ve görselleri
  * tabletin yerel hafızasına kaydeder. İnternet kesildiğinde otomatik önbellekten sunar.
@@ -238,20 +294,7 @@ private class OfflineMenuCache(
     private val appContext = context.applicationContext
     private val cacheDir = File(context.filesDir, "offline_menu_cache").apply { mkdirs() }
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
-        .followRedirects(true)
-        .followSslRedirects(true)
-        .dns(object : Dns {
-            override fun lookup(hostname: String): List<InetAddress> {
-                val addresses = Dns.SYSTEM.lookup(hostname)
-                return addresses.sortedBy { it !is Inet4Address }
-            }
-        })
-        .build()
+    private val httpClient = createResilientOkHttpClient(connectSec = 12, readSec = 20)
 
     fun cachedFileCount(): Int {
         return cacheDir.listFiles { _, name -> name.endsWith(".bin") }?.size ?: 0
@@ -776,72 +819,54 @@ private suspend fun downloadApkFile(
     apkUrl: String,
     onProgress: (Int) -> Unit
 ): Result<File> = withContext(Dispatchers.IO) {
-    var conn: HttpURLConnection? = null
     try {
-        var currentUrl = apkUrl.trim()
-        var redirects = 0
-        while (true) {
-            conn?.disconnect()
-            conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
-                instanceFollowRedirects = false
-                connectTimeout = 8000
-                readTimeout = 20000
-                setRequestProperty("User-Agent", "SimitCayKioskUpdater/2.0")
-            }
-            val code = conn.responseCode
-            if (code in listOf(301, 302, 303, 307, 308)) {
-                val loc = conn.getHeaderField("Location")
-                    ?: return@withContext Result.failure(Exception("Yönlendirme adresi alınamadı"))
-                currentUrl = URL(URL(currentUrl), loc).toString()
-                redirects++
-                if (redirects > 6) {
-                    return@withContext Result.failure(Exception("Çok fazla yönlendirme"))
-                }
-                continue
-            }
-            if (code !in 200..299) {
-                val hint = if (code == 404) {
-                    "APK bulunamadı (404). GitHub deponuz Gizli (Private) ise APK dosyasını simitcay.online sunucunuza yükleyip güncelleme adresini buraya yazabilirsiniz."
+        val client = createResilientOkHttpClient(connectSec = 15, readSec = 60)
+        val req = Request.Builder()
+            .url(apkUrl.trim())
+            .header("User-Agent", "SimitCayKioskUpdater/2.0")
+            .build()
+
+        client.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) {
+                val hint = if (resp.code == 404) {
+                    "APK bulunamadı (404). GitHub Release henüz hazır olmayabilir veya depo Gizli (Private) olabilir."
                 } else {
-                    "Sunucu hatası: HTTP $code"
+                    "Sunucu hatası: HTTP ${resp.code}"
                 }
                 return@withContext Result.failure(Exception(hint))
             }
-            break
-        }
 
-        val activeConn = conn ?: return@withContext Result.failure(Exception("Bağlantı kurulamadı"))
-        val totalBytes = activeConn.contentLengthLong
-        val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
-        val outFile = File(updatesDir, "SimitCay-Menu-update.apk")
+            val body = resp.body ?: return@withContext Result.failure(Exception("APK verisi boş"))
+            val totalBytes = body.contentLength()
+            val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
+            val outFile = File(updatesDir, "SimitCay-Menu-update.apk")
 
-        activeConn.inputStream.use { input ->
-            outFile.outputStream().use { output ->
-                val buffer = ByteArray(16384)
-                var downloaded = 0L
-                var read: Int
-                while (input.read(buffer).also { read = it } != -1) {
-                    output.write(buffer, 0, read)
-                    downloaded += read
-                    if (totalBytes > 0L) {
-                        val pct = ((downloaded * 100L) / totalBytes).toInt().coerceIn(0, 100)
-                        withContext(Dispatchers.Main) { onProgress(pct) }
+            body.byteStream().use { input ->
+                outFile.outputStream().use { output ->
+                    val buffer = ByteArray(16384)
+                    var downloaded = 0L
+                    var read: Int
+                    while (input.read(buffer).also { read = it } != -1) {
+                        output.write(buffer, 0, read)
+                        downloaded += read
+                        if (totalBytes > 0L) {
+                            val pct = ((downloaded * 100L) / totalBytes).toInt().coerceIn(0, 100)
+                            withContext(Dispatchers.Main) { onProgress(pct) }
+                        }
                     }
                 }
             }
-        }
 
-        val header = ByteArray(2)
-        outFile.inputStream().use { it.read(header) }
-        if (outFile.length() < 100_000L || header[0] != 0x50.toByte() || header[1] != 0x4B.toByte()) {
-            outFile.delete()
-            return@withContext Result.failure(Exception("İndirilen dosya geçerli bir APK değil."))
+            val header = ByteArray(2)
+            outFile.inputStream().use { it.read(header) }
+            if (outFile.length() < 100_000L || header[0] != 0x50.toByte() || header[1] != 0x4B.toByte()) {
+                outFile.delete()
+                return@withContext Result.failure(Exception("İndirilen dosya geçerli bir APK değil."))
+            }
+            Result.success(outFile)
         }
-        Result.success(outFile)
     } catch (e: Exception) {
         Result.failure(e)
-    } finally {
-        conn?.disconnect()
     }
 }
 
