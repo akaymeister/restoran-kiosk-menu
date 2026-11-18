@@ -99,9 +99,27 @@ class MainActivity : ComponentActivity() {
     private var activeWebView: WebView? = null
     private var userExitedKiosk = false
     private var promptedPinOnResume = false
-    private var lastInteractionElapsedMs by mutableStateOf(SystemClock.elapsedRealtime())
+    private val idleHandler = Handler(Looper.getMainLooper())
+    private var lastInteractionElapsedMs: Long = 0L
     private var isScreenSleepingState by mutableStateOf(false)
+    private var isAdminDialogOpen = false
+    private var configuredScreenTimeoutSec = DEFAULT_SCREEN_TIMEOUT_SEC
     private var swallowWakeGestureUntilUp = false
+
+    private val idleCheckRunnable = object : Runnable {
+        override fun run() {
+            val timeoutSec = configuredScreenTimeoutSec
+            if (timeoutSec > 0 && !isAdminDialogOpen && !isScreenSleepingState) {
+                val elapsed = SystemClock.elapsedRealtime() - lastInteractionElapsedMs
+                val remaining = (timeoutSec * 1000L) - elapsed
+                if (remaining <= 0L) {
+                    setScreenSleeping(true)
+                } else {
+                    idleHandler.postDelayed(this, remaining.coerceIn(250L, 1000L))
+                }
+            }
+        }
+    }
 
     companion object {
         private const val PREFS_NAME = "kiosk_config_v2"
@@ -119,8 +137,11 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        configuredScreenTimeoutSec = getSavedScreenTimeoutSec()
         lastInteractionElapsedMs = SystemClock.elapsedRealtime()
-        setScreenSleeping(false)
+        isScreenSleepingState = false
+        applyScreenWindowFlags(sleep = false)
+        scheduleIdleCheck()
 
         // Geri tuşuyla uygulamadan çıkışı engelle
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -139,13 +160,30 @@ class MainActivity : ComponentActivity() {
                     currentUrl = getSavedUrl(),
                     currentPin = getSavedPin(),
                     currentUpdateUrl = getSavedUpdateUrl(),
-                    initialScreenTimeoutSec = getSavedScreenTimeoutSec(),
+                    initialScreenTimeoutSec = configuredScreenTimeoutSec,
                     isDeviceOwner = isDeviceOwner(),
-                    lastInteractionElapsedMs = lastInteractionElapsedMs,
                     isScreenSleeping = isScreenSleepingState,
-                    onIdleSleep = { setScreenSleeping(true) },
-                    onWakeFromIdle = { wakeScreenFromIdle() },
-                    onSaveScreenTimeoutSec = { sec -> saveScreenTimeoutSec(sec) },
+                    onAdminDialogVisibilityChanged = { visible ->
+                        isAdminDialogOpen = visible
+                        lastInteractionElapsedMs = SystemClock.elapsedRealtime()
+                        if (visible) {
+                            idleHandler.removeCallbacks(idleCheckRunnable)
+                            wakeScreenFromIdle()
+                        } else {
+                            scheduleIdleCheck()
+                        }
+                    },
+                    onSaveScreenTimeoutSec = { sec ->
+                        saveScreenTimeoutSec(sec)
+                        configuredScreenTimeoutSec = sec.coerceAtLeast(0)
+                        lastInteractionElapsedMs = SystemClock.elapsedRealtime()
+                        if (configuredScreenTimeoutSec <= 0) {
+                            idleHandler.removeCallbacks(idleCheckRunnable)
+                            wakeScreenFromIdle()
+                        } else {
+                            scheduleIdleCheck()
+                        }
+                    },
                     onWebViewReady = { activeWebView = it },
                     onSaveUrl = { newUrl ->
                         val normalized = normalizeMenuUrl(newUrl)
@@ -188,7 +226,7 @@ class MainActivity : ComponentActivity() {
             if (isScreenSleepingState) {
                 if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
                     swallowWakeGestureUntilUp = true
-                    setScreenSleeping(false)
+                    wakeScreenFromIdle()
                 }
                 return true
             }
@@ -200,7 +238,7 @@ class MainActivity : ComponentActivity() {
         lastInteractionElapsedMs = SystemClock.elapsedRealtime()
         if (isScreenSleepingState) {
             if (event.action == KeyEvent.ACTION_DOWN) {
-                setScreenSleeping(false)
+                wakeScreenFromIdle()
             }
             return true
         }
@@ -210,11 +248,22 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         wakeScreenFromIdle()
+        scheduleIdleCheck()
         hideSystemUI()
         if (!userExitedKiosk) {
             setupKioskMode(forcePinPrompt = !promptedPinOnResume)
             promptedPinOnResume = true
         }
+    }
+
+    override fun onPause() {
+        idleHandler.removeCallbacks(idleCheckRunnable)
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        idleHandler.removeCallbacks(idleCheckRunnable)
+        super.onDestroy()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -224,14 +273,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun setScreenSleeping(sleep: Boolean) {
-        isScreenSleepingState = sleep
+    private fun scheduleIdleCheck() {
+        idleHandler.removeCallbacks(idleCheckRunnable)
+        val timeoutSec = configuredScreenTimeoutSec
+        if (timeoutSec > 0 && !isAdminDialogOpen && !isScreenSleepingState) {
+            val elapsed = SystemClock.elapsedRealtime() - lastInteractionElapsedMs
+            val remaining = (timeoutSec * 1000L) - elapsed
+            idleHandler.postDelayed(idleCheckRunnable, remaining.coerceIn(250L, 1000L))
+        }
+    }
+
+    private fun applyScreenWindowFlags(sleep: Boolean) {
         runOnUiThread {
             try {
                 val attrs = window.attributes
                 if (sleep) {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                    attrs.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_OFF
+                    attrs.screenBrightness = 0.01f
                 } else {
                     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     attrs.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
@@ -245,10 +303,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun setScreenSleeping(sleep: Boolean) {
+        if (isScreenSleepingState == sleep) return
+        isScreenSleepingState = sleep
+        if (sleep) {
+            idleHandler.removeCallbacks(idleCheckRunnable)
+        } else {
+            lastInteractionElapsedMs = SystemClock.elapsedRealtime()
+            scheduleIdleCheck()
+        }
+        applyScreenWindowFlags(sleep)
+    }
+
     private fun wakeScreenFromIdle() {
         lastInteractionElapsedMs = SystemClock.elapsedRealtime()
         if (isScreenSleepingState) {
             setScreenSleeping(false)
+        } else {
+            scheduleIdleCheck()
         }
     }
 
@@ -854,10 +926,8 @@ fun KioskScreen(
     currentUpdateUrl: String,
     initialScreenTimeoutSec: Int,
     isDeviceOwner: Boolean,
-    lastInteractionElapsedMs: Long,
     isScreenSleeping: Boolean,
-    onIdleSleep: () -> Unit,
-    onWakeFromIdle: () -> Unit,
+    onAdminDialogVisibilityChanged: (Boolean) -> Unit,
     onSaveScreenTimeoutSec: (Int) -> Unit,
     onWebViewReady: (WebView) -> Unit,
     onSaveUrl: (String) -> String,
@@ -968,22 +1038,8 @@ fun KioskScreen(
         }
     }
 
-    // 30 saniye hareketsizlikte ekranı uyku moduna al
-    LaunchedEffect(screenTimeoutSec, showAdminDialog) {
-        if (screenTimeoutSec <= 0) {
-            onWakeFromIdle()
-            return@LaunchedEffect
-        }
-        while (true) {
-            if (!showAdminDialog && !isScreenSleeping) {
-                val elapsedMs = SystemClock.elapsedRealtime() - lastInteractionElapsedMs
-                val timeoutMs = screenTimeoutSec * 1000L
-                if (elapsedMs >= timeoutMs) {
-                    onIdleSleep()
-                }
-            }
-            delay(1000)
-        }
+    LaunchedEffect(showAdminDialog) {
+        onAdminDialogVisibilityChanged(showAdminDialog)
     }
 
     DisposableEffect(Unit) {
@@ -1314,7 +1370,6 @@ fun KioskScreen(
                 appVersion = appVersionLabel,
                 isDeviceOwner = isDeviceOwner,
                 onDismiss = {
-                    onWakeFromIdle()
                     showAdminDialog = false
                 },
                 onSaveUrl = { newUrl ->
