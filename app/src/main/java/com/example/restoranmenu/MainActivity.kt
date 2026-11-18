@@ -2,10 +2,13 @@ package com.example.restoranmenu
 
 import android.annotation.SuppressLint
 import android.app.ActivityManager
+import android.app.PendingIntent
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageInstaller
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -14,6 +17,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.*
@@ -23,7 +27,9 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -37,11 +43,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.restoranmenu.ui.theme.RestoranMenuTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.HttpURLConnection
@@ -59,8 +69,11 @@ class MainActivity : ComponentActivity() {
         private const val PREFS_NAME = "kiosk_config_v2"
         private const val KEY_MENU_URL = "menu_url_v2"
         private const val KEY_ADMIN_PIN = "admin_pin_v2"
+        private const val KEY_UPDATE_URL = "update_apk_url_v2"
         private const val DEFAULT_URL = "https://www.simitcay.online/tablet.html"
         private const val DEFAULT_PIN = "1234"
+        private const val DEFAULT_UPDATE_URL =
+            "https://github.com/akaymeister/restoran-kiosk-menu/releases/latest/download/SimitCay-Menu.apk"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,12 +97,18 @@ class MainActivity : ComponentActivity() {
                 KioskScreen(
                     currentUrl = getSavedUrl(),
                     currentPin = getSavedPin(),
+                    currentUpdateUrl = getSavedUpdateUrl(),
                     isDeviceOwner = isDeviceOwner(),
                     onWebViewReady = { activeWebView = it },
                     onSaveUrl = { newUrl ->
                         val normalized = normalizeMenuUrl(newUrl)
                         saveUrl(normalized)
                         normalized
+                    },
+                    onSaveUpdateUrl = { newUpdateUrl ->
+                        val clean = newUpdateUrl.trim().ifEmpty { DEFAULT_UPDATE_URL }
+                        saveUpdateUrl(clean)
+                        clean
                     },
                     onSavePin = { newPin -> savePin(newPin) },
                     onLockKiosk = {
@@ -183,6 +202,10 @@ class MainActivity : ComponentActivity() {
 
     private fun getSavedPin(): String = prefs.getString(KEY_ADMIN_PIN, DEFAULT_PIN) ?: DEFAULT_PIN
     private fun savePin(pin: String) = prefs.edit().putString(KEY_ADMIN_PIN, pin).apply()
+
+    private fun getSavedUpdateUrl(): String =
+        prefs.getString(KEY_UPDATE_URL, DEFAULT_UPDATE_URL)?.takeIf { it.isNotBlank() } ?: DEFAULT_UPDATE_URL
+    private fun saveUpdateUrl(url: String) = prefs.edit().putString(KEY_UPDATE_URL, url).apply()
 }
 
 private fun isNetworkAvailable(context: Context): Boolean {
@@ -379,9 +402,11 @@ private class OfflineMenuCache(
 fun KioskScreen(
     currentUrl: String,
     currentPin: String,
+    currentUpdateUrl: String,
     isDeviceOwner: Boolean,
     onWebViewReady: (WebView) -> Unit,
     onSaveUrl: (String) -> String,
+    onSaveUpdateUrl: (String) -> String,
     onSavePin: (String) -> Unit,
     onLockKiosk: () -> Unit,
     onExitKioskMode: () -> Unit
@@ -394,6 +419,7 @@ fun KioskScreen(
     var showInitialError by remember { mutableStateOf(false) }
     var showAdminDialog by remember { mutableStateOf(false) }
     var targetUrl by remember { mutableStateOf(currentUrl) }
+    var updateApkUrl by remember { mutableStateOf(currentUpdateUrl) }
     var lastLoadedUrl by remember { mutableStateOf(currentUrl) }
     var cachedCount by remember { mutableStateOf(0) }
 
@@ -652,6 +678,7 @@ fun KioskScreen(
             HardenedAdminDialog(
                 currentPin = currentPin,
                 currentUrl = targetUrl,
+                currentUpdateUrl = updateApkUrl,
                 cachedCount = cachedCount,
                 appVersion = appVersionLabel,
                 isDeviceOwner = isDeviceOwner,
@@ -659,6 +686,11 @@ fun KioskScreen(
                 onSaveUrl = { newUrl ->
                     val normalized = onSaveUrl(newUrl)
                     targetUrl = normalized
+                },
+                onSaveUpdateUrl = { newUpdateUrl ->
+                    val clean = onSaveUpdateUrl(newUpdateUrl)
+                    updateApkUrl = clean
+                    clean
                 },
                 onSavePin = { onSavePin(it) },
                 onReload = {
@@ -684,26 +716,160 @@ fun KioskScreen(
     }
 }
 
+private suspend fun downloadApkFile(
+    context: Context,
+    apkUrl: String,
+    onProgress: (Int) -> Unit
+): Result<File> = withContext(Dispatchers.IO) {
+    var conn: HttpURLConnection? = null
+    try {
+        var currentUrl = apkUrl.trim()
+        var redirects = 0
+        while (true) {
+            conn?.disconnect()
+            conn = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                connectTimeout = 8000
+                readTimeout = 20000
+                setRequestProperty("User-Agent", "SimitCayKioskUpdater/2.0")
+            }
+            val code = conn.responseCode
+            if (code in listOf(301, 302, 303, 307, 308)) {
+                val loc = conn.getHeaderField("Location")
+                    ?: return@withContext Result.failure(Exception("Yönlendirme adresi alınamadı"))
+                currentUrl = URL(URL(currentUrl), loc).toString()
+                redirects++
+                if (redirects > 6) {
+                    return@withContext Result.failure(Exception("Çok fazla yönlendirme"))
+                }
+                continue
+            }
+            if (code !in 200..299) {
+                val hint = if (code == 404) {
+                    "APK bulunamadı (404). GitHub deponuz Gizli (Private) ise APK dosyasını simitcay.online sunucunuza yükleyip güncelleme adresini buraya yazabilirsiniz."
+                } else {
+                    "Sunucu hatası: HTTP $code"
+                }
+                return@withContext Result.failure(Exception(hint))
+            }
+            break
+        }
+
+        val activeConn = conn ?: return@withContext Result.failure(Exception("Bağlantı kurulamadı"))
+        val totalBytes = activeConn.contentLengthLong
+        val updatesDir = File(context.cacheDir, "updates").apply { mkdirs() }
+        val outFile = File(updatesDir, "SimitCay-Menu-update.apk")
+
+        activeConn.inputStream.use { input ->
+            outFile.outputStream().use { output ->
+                val buffer = ByteArray(16384)
+                var downloaded = 0L
+                var read: Int
+                while (input.read(buffer).also { read = it } != -1) {
+                    output.write(buffer, 0, read)
+                    downloaded += read
+                    if (totalBytes > 0L) {
+                        val pct = ((downloaded * 100L) / totalBytes).toInt().coerceIn(0, 100)
+                        withContext(Dispatchers.Main) { onProgress(pct) }
+                    }
+                }
+            }
+        }
+
+        val header = ByteArray(2)
+        outFile.inputStream().use { it.read(header) }
+        if (outFile.length() < 100_000L || header[0] != 0x50.toByte() || header[1] != 0x4B.toByte()) {
+            outFile.delete()
+            return@withContext Result.failure(Exception("İndirilen dosya geçerli bir APK değil."))
+        }
+        Result.success(outFile)
+    } catch (e: Exception) {
+        Result.failure(e)
+    } finally {
+        conn?.disconnect()
+    }
+}
+
+private fun installApkFile(
+    context: Context,
+    apkFile: File,
+    isDeviceOwner: Boolean,
+    onExitKiosk: () -> Unit
+): String {
+    if (isDeviceOwner) {
+        try {
+            val packageInstaller = context.packageManager.packageInstaller
+            val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+            val sessionId = packageInstaller.createSession(params)
+            val session = packageInstaller.openSession(sessionId)
+            session.openWrite("SimitCayUpdate", 0, apkFile.length()).use { out ->
+                apkFile.inputStream().use { input -> input.copyTo(out) }
+                session.fsync(out)
+            }
+            val intent = Intent("com.example.restoranmenu.INSTALL_COMPLETE").setPackage(context.packageName)
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            } else {
+                PendingIntent.FLAG_UPDATE_CURRENT
+            }
+            val sender = PendingIntent.getBroadcast(context, sessionId, intent, flags).intentSender
+            session.commit(sender)
+            session.close()
+            return "Sessiz güncelleme başlatıldı, uygulama güncellenip yeniden açılacak..."
+        } catch (_: Exception) {
+            // Normal kurulum ekranına düş
+        }
+    }
+
+    onExitKiosk()
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !context.packageManager.canRequestPackageInstalls()) {
+        val permIntent = Intent(
+            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+            Uri.parse("package:${context.packageName}")
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(permIntent)
+        return "Açılan ekrandan 'Bu kaynaktan izin ver' seçeneğini açın, sonra tekrar 'Uygulamayı Güncelle'ye basın."
+    }
+    val apkUri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        apkFile
+    )
+    val installIntent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(apkUri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    context.startActivity(installIntent)
+    return "Kurulum ekranı açıldı. 'Güncelle'ye basarak silmeden kurabilirsiniz."
+}
+
 @Composable
 fun HardenedAdminDialog(
     currentPin: String,
     currentUrl: String,
+    currentUpdateUrl: String,
     cachedCount: Int,
     appVersion: String,
     isDeviceOwner: Boolean,
     onDismiss: () -> Unit,
     onSaveUrl: (String) -> Unit,
+    onSaveUpdateUrl: (String) -> String,
     onSavePin: (String) -> Unit,
     onReload: () -> Unit,
     onClearCacheAndReload: () -> Unit,
     onLockKiosk: () -> Unit,
     onExitKiosk: () -> Unit
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var isAuthenticated by remember { mutableStateOf(false) }
     var password by remember { mutableStateOf("") }
     var isError by remember { mutableStateOf(false) }
     var urlInput by remember { mutableStateOf(currentUrl) }
+    var updateUrlInput by remember { mutableStateOf(currentUpdateUrl) }
     var newPinInput by remember { mutableStateOf("") }
+    var isUpdatingApk by remember { mutableStateOf(false) }
+    var updateStatus by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -724,7 +890,10 @@ fun HardenedAdminDialog(
                     )
                 }
             } else {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.verticalScroll(rememberScrollState())
+                ) {
                     Text(
                         text = "Sürüm: $appVersion",
                         fontSize = 11.sp,
@@ -750,10 +919,60 @@ fun HardenedAdminDialog(
                         fontSize = 11.sp,
                         color = Color.Gray
                     )
+
+                    Button(
+                        onClick = {
+                            if (isUpdatingApk) return@Button
+                            val cleanUrl = onSaveUpdateUrl(updateUrlInput)
+                            isUpdatingApk = true
+                            updateStatus = "APK indiriliyor..."
+                            scope.launch {
+                                val res = downloadApkFile(context, cleanUrl) { pct ->
+                                    updateStatus = "APK indiriliyor (%$pct)..."
+                                }
+                                isUpdatingApk = false
+                                res.onSuccess { apkFile ->
+                                    try {
+                                        updateStatus = installApkFile(
+                                            context = context,
+                                            apkFile = apkFile,
+                                            isDeviceOwner = isDeviceOwner,
+                                            onExitKiosk = onExitKiosk
+                                        )
+                                    } catch (e: Exception) {
+                                        updateStatus = "Kurulum başlatılamadı: ${e.message}"
+                                    }
+                                }.onFailure { err ->
+                                    updateStatus = err.message ?: "APK indirilemedi"
+                                }
+                            }
+                        },
+                        enabled = !isUpdatingApk,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(if (isUpdatingApk) "Güncelleme İndiriliyor..." else "Uygulamayı Güncelle (APK)")
+                    }
+
+                    if (!updateStatus.isNullOrBlank()) {
+                        Text(
+                            text = updateStatus!!,
+                            fontSize = 11.sp,
+                            color = Color(0xFF0F172A),
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+
                     OutlinedTextField(
                         value = urlInput,
                         onValueChange = { urlInput = it },
                         label = { Text("Menü Web Adresi (URL)") },
+                        singleLine = true
+                    )
+                    OutlinedTextField(
+                        value = updateUrlInput,
+                        onValueChange = { updateUrlInput = it },
+                        label = { Text("APK Güncelleme Adresi (URL)") },
                         singleLine = true
                     )
                     OutlinedTextField(
@@ -770,6 +989,7 @@ fun HardenedAdminDialog(
                         Button(
                             onClick = {
                                 onSaveUrl(urlInput)
+                                onSaveUpdateUrl(updateUrlInput)
                                 if (newPinInput.isNotBlank()) onSavePin(newPinInput)
                                 onDismiss()
                             }
