@@ -13,6 +13,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -63,8 +64,18 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.URL
 import java.net.UnknownHostException
+import java.security.KeyStore
 import java.security.MessageDigest
+import java.security.SecureRandom
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.HttpsURLConnection
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.TrustManager
+import javax.net.ssl.TrustManagerFactory
+import javax.net.ssl.X509TrustManager
 
 class MainActivity : ComponentActivity() {
 
@@ -153,11 +164,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun hideSystemUI() {
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        val controller = WindowCompat.getInsetsController(window, window.decorView)
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        controller.systemBarsBehavior =
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        try {
+            WindowCompat.setDecorFitsSystemWindows(window, false)
+            val controller = WindowCompat.getInsetsController(window, window.decorView)
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } catch (_: Exception) {
+        }
     }
 
     private fun isDeviceOwner(): Boolean {
@@ -229,11 +243,136 @@ private fun isNetworkAvailable(context: Context): Boolean {
     }
 }
 
+private object KioskTlsHelper {
+    @Volatile
+    var simitcayVerifiedByOkHttp: Boolean = false
+
+    // Sectigo Public Server Authentication Root R46 (simitcay.online için eski Android 7-13 uyumu)
+    private const val SECTIGO_ROOT_R46_PEM =
+        "-----BEGIN CERTIFICATE-----\n" +
+        "MIIFijCCA3KgAwIBAgIQdY39i658BwD6qSWn4cetFDANBgkqhkiG9w0BAQwFADBf\n" +
+        "MQswCQYDVQQGEwJHQjEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMTYwNAYDVQQD\n" +
+        "Ey1TZWN0aWdvIFB1YmxpYyBTZXJ2ZXIgQXV0aGVudGljYXRpb24gUm9vdCBSNDYw\n" +
+        "HhcNMjEwMzIyMDAwMDAwWhcNNDYwMzIxMjM1OTU5WjBfMQswCQYDVQQGEwJHQjEY\n" +
+        "MBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMTYwNAYDVQQDEy1TZWN0aWdvIFB1Ymxp\n" +
+        "YyBTZXJ2ZXIgQXV0aGVudGljYXRpb24gUm9vdCBSNDYwggIiMA0GCSqGSIb3DQEB\n" +
+        "AQUAA4ICDwAwggIKAoICAQCTvtU2UnXYASOgHEdCSe5jtrch/cSV1UgrJnwUUxDa\n" +
+        "ef0rty2k1Cz66jLdScK5vQ9IPXtamFSvnl0xdE8H/FAh3aTPaE8bEmNtJZlMKpn\n" +
+        "zSDBh+oF8HqcIStw+KxwfGExxqjWMrfhu6DtK2eWUAtaJhBOqbchPM8xQljeSM9x\n" +
+        "fiOefVNlI8JhD1mb9nxc4Q8UBUQvX4yMPFF1bFOdLvt30yNoDN9HWOaEhUTCDsG3\n" +
+        "XME6WW5HwcCSrv0WBZEMNvSE6Lzzpng3LILVCJ8zab5vuZDCQOc2TZYEhMbUjUDM\n" +
+        "3IuM47fgxMMxF/mL50V0yeUKH32rMVhlATc6qu/m1dkmU8Sf4kaWD5QazYw6A3OA\n" +
+        "SVYCmO2a0OYctyPDQ0RTp5A1NDvZdV3LFOxxHVp3i1fuBYYzMTYCQNFu31xR13Ng\n" +
+        "ESJ/AwSiItOkcyqex8Va3e0lMWeUgFaiEAin6OJRpmkkGj80feRQXEgyDet4fsZf\n" +
+        "u+Zd4KKTIRJLpfSYFplhym3kT2BFfrsU4YjRosoYwjviQYZ4ybPUHNs2iTG7sijb\n" +
+        "t8uaZFURww3y8nDnAtOFr94MlI1fZEoDlSfB1D++N6xybVCi0ITz8fAr/73trdf+\n" +
+        "LHaAZBav6+CuBQug4urv7qv094PPK306Xlynt8xhW6aWWrL3DkJiy4Pmi1KZHQ3x\n" +
+        "tzwIDAQABo0IwQDAdBgNVHQ4EFgQUVnNYZJX5khqwEioEYnmhQBWIIUkwDgYDVR0P\n" +
+        "AQH/BAQDAgGGMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQEMBQADggIBAC9c\n" +
+        "mTz8Bl6MlC5w6tIyMY208FHVvArzZJ8HXtXBc2hkeqK5Duj5XYUtqDdFqij0lgVQ\n" +
+        "YKlJfp/imTYpE0RHap1VIDzYm/EDMrraQKFz6oOht0SmDpkBm+S8f74TlH7Kph52\n" +
+        "gDY9hAaLMyZlbcp+nv4fjFg4exqDsQ+8FxG75gbMY/qB8oFM2gsQa6H61SilzwZA\n" +
+        "Fv97fRheORKkU55+MkIQpiGRqRxOF3yEvJ+M0ejf5lG5Nkc/kLnHvALcWxxPDkjB\n" +
+        "JYOcCj+esQMzEhonrPcibCTRAUH4WAP+JWgiH5paPHxsnnVI84HxZmduTILA7rpX\n" +
+        "DhjvLpr3Etiga+kFpaHpaPi8TD8SHkXoUsCjvxInebnMMTzD9joiFgOgyY9mpFui\n" +
+        "TdaBJQbpdqQACj7LzTWb4OE4y2BThihCQRxEV+ioratF4yUQvNs+ZUH7G6aXD+u5\n" +
+        "dHn5HrwdVw1Hr8Mvn4dGp+smWg9WY7ViYG4A++MnESLn/pmPNPW56MORcr3Ywx65\n" +
+        "LvKRRFHQV80MNNVIIb/bE/FmJUNS0nAiNs2fxBx1IK1jcmMGDw4nztJqDby1ORrp\n" +
+        "0XZ60Vzk50lJLVU3aPAaOpg+VBeHVOmmJ1CJeyAvP/+/oYtKR5j/K3tJPsMpRmAY\n" +
+        "QqszKbrAKbkTidOIijlBO8n9pu0f9GBj39ItVQGL\n" +
+        "-----END CERTIFICATE-----"
+
+    // Let's Encrypt ISRG Root X1 (GitHub Release APK indirme uyumu)
+    private const val ISRG_ROOT_X1_PEM =
+        "-----BEGIN CERTIFICATE-----\n" +
+        "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\n" +
+        "1AnX5iItreGCc=\n" +
+        "-----END CERTIFICATE-----"
+
+    val trustManager: X509TrustManager? by lazy { buildCombinedTrustManager() }
+    val sslSocketFactory: SSLSocketFactory? by lazy {
+        val tm = trustManager ?: return@lazy null
+        try {
+            val ctx = SSLContext.getInstance("TLS")
+            ctx.init(null, arrayOf<TrustManager>(tm), SecureRandom())
+            ctx.socketFactory
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun buildCombinedTrustManager(): X509TrustManager? {
+        return try {
+            val sysTmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            sysTmf.init(null as KeyStore?)
+            val sysTm = sysTmf.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()
+
+            val ks = KeyStore.getInstance(KeyStore.getDefaultType())
+            ks.load(null, null)
+            var idx = 0
+            sysTm?.acceptedIssuers?.forEach { cert ->
+                ks.setCertificateEntry("sys_${idx++}", cert)
+            }
+            val cf = CertificateFactory.getInstance("X.509")
+            listOf(SECTIGO_ROOT_R46_PEM, ISRG_ROOT_X1_PEM).forEach { pem ->
+                val cert = cf.generateCertificate(ByteArrayInputStream(pem.toByteArray(Charsets.UTF_8))) as X509Certificate
+                ks.setCertificateEntry("kiosk_${idx++}", cert)
+            }
+            val combinedTmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+            combinedTmf.init(ks)
+            combinedTmf.trustManagers.filterIsInstance<X509TrustManager>().firstOrNull()
+        } catch (_: Exception) {
+            null
+        }
+    }
+}
+
+private fun detectChromeMajor(context: Context): Int {
+    return try {
+        val ua = WebSettings.getDefaultUserAgent(context)
+        val match = Regex("Chrome/(\\d+)").find(ua)
+        match?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+    } catch (_: Exception) {
+        0
+    }
+}
+
 private fun resolveViaGoogleDoh(hostname: String): List<InetAddress> {
     var conn: HttpURLConnection? = null
     return try {
         val url = URL("https://8.8.8.8/resolve?name=$hostname&type=A")
         conn = (url.openConnection() as HttpURLConnection).apply {
+            if (this is HttpsURLConnection) {
+                KioskTlsHelper.sslSocketFactory?.let { this.sslSocketFactory = it }
+            }
             connectTimeout = 5000
             readTimeout = 5000
             setRequestProperty("Accept", "application/dns-json")
@@ -263,7 +402,7 @@ private fun createResilientOkHttpClient(
     connectSec: Long = 12,
     readSec: Long = 20
 ): OkHttpClient {
-    return OkHttpClient.Builder()
+    val builder = OkHttpClient.Builder()
         .connectTimeout(connectSec, TimeUnit.SECONDS)
         .readTimeout(readSec, TimeUnit.SECONDS)
         .writeTimeout(15, TimeUnit.SECONDS)
@@ -280,21 +419,33 @@ private fun createResilientOkHttpClient(
                 }
             }
         })
-        .build()
+
+    val tm = KioskTlsHelper.trustManager
+    val ssf = KioskTlsHelper.sslSocketFactory
+    if (tm != null && ssf != null) {
+        builder.sslSocketFactory(ssf, tm)
+    }
+    return builder.build()
 }
 
 /**
  * Sunucudan "no-store" gelse bile tablet.html, JS, CSS, menu-data.php ve görselleri
- * tabletin yerel hafızasına kaydeder. İnternet kesildiğinde otomatik önbellekten sunar.
+ * tabletin yerel hafızasına kaydeder. Eski Android 7-10 WebView uyumluluğu sağlar ve
+ * internet kesildiğinde otomatik önbellekten sunar.
  */
 private class OfflineMenuCache(
     context: Context,
-    private val onConnectionStatusChanged: (Boolean) -> Unit
+    private val chromeMajor: Int,
+    private val onConnectionStatusChanged: (Boolean) -> Unit,
+    private val onCoreError: (String) -> Unit
 ) {
     private val appContext = context.applicationContext
     private val cacheDir = File(context.filesDir, "offline_menu_cache").apply { mkdirs() }
     private val mainHandler = Handler(Looper.getMainLooper())
     private val httpClient = createResilientOkHttpClient(connectSec = 12, readSec = 20)
+    private val fontsClient = createResilientOkHttpClient(connectSec = 4, readSec = 5)
+    @Volatile var lastMainFrameLoaded: Boolean = false
+        private set
 
     fun cachedFileCount(): Int {
         return cacheDir.listFiles { _, name -> name.endsWith(".bin") }?.size ?: 0
@@ -331,29 +482,17 @@ private class OfflineMenuCache(
     fun shouldIntercept(request: WebResourceRequest): Boolean {
         if (request.method != "GET") return false
         val uri = request.url ?: return false
-        val host = uri.host ?: return false
+        val host = uri.host?.lowercase() ?: return false
+        if (host == "fonts.googleapis.com" || host == "fonts.gstatic.com") return true
         if (!host.endsWith("simitcay.online")) return false
         val path = uri.path?.lowercase() ?: ""
         if (path.endsWith(".mp4") || path.endsWith(".webm")) return false
-        return path.endsWith(".html") ||
-            path.endsWith(".css") ||
-            path.endsWith(".js") ||
-            path.endsWith(".json") ||
-            path.endsWith(".png") ||
-            path.endsWith(".jpg") ||
-            path.endsWith(".jpeg") ||
-            path.endsWith(".webp") ||
-            path.endsWith(".svg") ||
-            path.endsWith(".woff") ||
-            path.endsWith(".woff2") ||
-            path.endsWith(".ttf") ||
-            path.contains("menu-data.php") ||
-            path.contains("site-logo.php") ||
-            path.contains("api.php")
+        return true
     }
 
     fun fetchOrServeCached(request: WebResourceRequest): WebResourceResponse? {
         val uri = request.url ?: return null
+        val host = uri.host?.lowercase() ?: ""
         val fullUrl = uri.toString()
         val path = uri.path?.lowercase() ?: ""
         val action = uri.getQueryParameter("action")
@@ -364,13 +503,43 @@ private class OfflineMenuCache(
         }
         val exactKey = hashKey(fullUrl)
         val fallbackKey = hashKey(fallbackUrl)
-        val isCoreMenuRequest = request.isForMainFrame ||
+        val isFontHost = host == "fonts.googleapis.com" || host == "fonts.gstatic.com"
+        val isCoreMenuRequest = !isFontHost && (
+            request.isForMainFrame ||
             path.endsWith("tablet.html") ||
             path.contains("menu-data.php") ||
             path.contains("api.php")
+        )
+        val cachedBefore = load(exactKey, path) ?: load(fallbackKey, path)
         val onlineNow = isNetworkAvailable(appContext)
+        var lastErrMsg: String? = null
 
-        if (onlineNow) {
+        // Google Fonts hızlı önbellekten veya ağdan çekilir; ulaşılamazsa sayfa çizimini kilitlememesi için boş CSS döner.
+        if (isFontHost) {
+            if (cachedBefore != null) return cachedBefore
+            if (onlineNow) {
+                try {
+                    val fontReq = Request.Builder().url(fullUrl).build()
+                    fontsClient.newCall(fontReq).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val bytes = resp.body?.bytes()
+                            if (bytes != null) {
+                                val mime = resp.header("Content-Type")?.substringBefore(";")?.trim()
+                                    ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
+                                save(exactKey, bytes, mime)
+                                return buildResponse(bytes, mime, path)
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            val emptyMime = if (host == "fonts.googleapis.com") "text/css" else "application/octet-stream"
+            return WebResourceResponse(emptyMime, "UTF-8", 200, "OK", mapOf("Access-Control-Allow-Origin" to "*"), ByteArrayInputStream(ByteArray(0)))
+        }
+
+        // İnternet görünüyorsa VEYA henüz önbellekte hiç kayıt yoksa ağdan dene (eski tabletlerde ConnectivityManager bazen false döner)
+        if (onlineNow || cachedBefore == null) {
             try {
                 val okReq = Request.Builder()
                     .url(fullUrl)
@@ -385,6 +554,12 @@ private class OfflineMenuCache(
                     if (resp.isSuccessful) {
                         val bytes = resp.body?.bytes()
                         if (bytes != null) {
+                            if (host.endsWith("simitcay.online")) {
+                                KioskTlsHelper.simitcayVerifiedByOkHttp = true
+                            }
+                            if (request.isForMainFrame) {
+                                lastMainFrameLoaded = true
+                            }
                             val mime = resp.header("Content-Type")?.substringBefore(";")?.trim()
                                 ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
                             save(exactKey, bytes, mime)
@@ -394,13 +569,17 @@ private class OfflineMenuCache(
                             if (isCoreMenuRequest) {
                                 mainHandler.post { onConnectionStatusChanged(true) }
                             }
-                            return buildResponse(bytes, mime)
+                            return buildResponse(bytes, mime, path)
                         }
-                    } else if (isCoreMenuRequest) {
-                        mainHandler.post { onConnectionStatusChanged(false) }
+                    } else {
+                        lastErrMsg = "HTTP ${resp.code}"
+                        if (isCoreMenuRequest) {
+                            mainHandler.post { onConnectionStatusChanged(false) }
+                        }
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                lastErrMsg = "${e.javaClass.simpleName}: ${e.message ?: "Bağlantı hatası"}"
                 if (isCoreMenuRequest) {
                     mainHandler.post { onConnectionStatusChanged(false) }
                 }
@@ -409,7 +588,21 @@ private class OfflineMenuCache(
             mainHandler.post { onConnectionStatusChanged(false) }
         }
 
-        return load(exactKey) ?: load(fallbackKey)
+        if (cachedBefore != null) {
+            if (request.isForMainFrame) {
+                lastMainFrameLoaded = true
+            }
+            return cachedBefore
+        }
+
+        if (request.isForMainFrame) {
+            lastMainFrameLoaded = false
+            val err = lastErrMsg ?: "İnternet bağlantısı yok"
+            mainHandler.post { onCoreError(err) }
+            val placeholder = "<!doctype html><html><body style='margin:0;background:#092746'></body></html>".toByteArray(Charsets.UTF_8)
+            return WebResourceResponse("text/html", "UTF-8", 200, "OK", emptyMap(), ByteArrayInputStream(placeholder))
+        }
+        return null
     }
 
     private fun save(key: String, bytes: ByteArray, mime: String) {
@@ -420,27 +613,74 @@ private class OfflineMenuCache(
         }
     }
 
-    private fun load(key: String): WebResourceResponse? {
+    private fun load(key: String, path: String = ""): WebResourceResponse? {
         val dataFile = File(cacheDir, "$key.bin")
         val mimeFile = File(cacheDir, "$key.mime")
         if (!dataFile.exists()) return null
         val bytes = dataFile.readBytes()
         val mime = if (mimeFile.exists()) mimeFile.readText().trim() else "application/octet-stream"
-        return buildResponse(bytes, mime)
+        return buildResponse(bytes, mime, path)
     }
 
     private fun injectPolyfill(bytes: ByteArray): ByteArray {
-        val polyfill = "<script>(function(){if(!Object.hasOwn){Object.hasOwn=function(o,p){return o!=null&&Object.prototype.hasOwnProperty.call(o,p);};}if(!String.prototype.replaceAll){String.prototype.replaceAll=function(s,r){if(s instanceof RegExp)return this.replace(s,r);var v=typeof r==='function'?r(String(s)):String(r);return this.split(String(s)).join(v);};}})();</script>"
+        val polyfill = "<script>var __oc,__nc;(function(){" +
+            "if(!Object.hasOwn){Object.hasOwn=function(o,p){return o!=null&&Object.prototype.hasOwnProperty.call(o,p);};}" +
+            "if(!String.prototype.replaceAll){String.prototype.replaceAll=function(s,r){if(s instanceof RegExp)return this.replace(s,r);var v=typeof r==='function'?r(String(s)):String(r);return this.split(String(s)).join(v);};}" +
+            "if(!Array.prototype.at){Array.prototype.at=function(n){n=Math.trunc(n)||0;if(n<0)n+=this.length;if(n<0||n>=this.length)return undefined;return this[n];};}" +
+            "var rc=function(){while(this.firstChild)this.removeChild(this.firstChild);for(var i=0;i<arguments.length;i++){var n=arguments[i];this.appendChild(typeof n==='string'?document.createTextNode(n):n);}};" +
+            "if(typeof Element!=='undefined'&&!Element.prototype.replaceChildren){Element.prototype.replaceChildren=rc;}" +
+            "if(typeof DocumentFragment!=='undefined'&&!DocumentFragment.prototype.replaceChildren){DocumentFragment.prototype.replaceChildren=rc;}" +
+            "try{document.querySelectorAll(':has(*)');}catch(_e){" +
+            "var wrapQsa=function(orig){return function(sel){try{return orig.call(this,sel);}catch(err){if(typeof sel==='string'&&sel.indexOf(':has(')!==-1){var parts=sel.split(','),out=[],seen=[];for(var i=0;i<parts.length;i++){var p=parts[i].trim();if(p==='header>a:has(img[data-brand-logo])'){var imgs=this.querySelectorAll('header > a > img[data-brand-logo]');for(var k=0;k<imgs.length;k++){var pa=imgs[k].parentNode;if(pa&&seen.indexOf(pa)===-1){seen.push(pa);out.push(pa);}}}else if(p.indexOf(':has(')===-1){try{var list=orig.call(this,p);for(var j=0;j<list.length;j++){if(seen.indexOf(list[j])===-1){seen.push(list[j]);out.push(list[j]);}}}catch(_x){}}}return out;}return [];}};};" +
+            "if(typeof Document!=='undefined')Document.prototype.querySelectorAll=wrapQsa(Document.prototype.querySelectorAll);" +
+            "if(typeof Element!=='undefined')Element.prototype.querySelectorAll=wrapQsa(Element.prototype.querySelectorAll);" +
+            "}" +
+            "})();</script>"
         val html = bytes.toString(Charsets.UTF_8)
-        return if (!html.contains("Object.hasOwn=function") && html.contains("<head>")) {
-            html.replaceFirst("<head>", "<head>$polyfill").toByteArray(Charsets.UTF_8)
+        val headIdx = html.indexOf("<head>")
+        return if (!html.contains("var __oc,__nc;") && headIdx >= 0) {
+            (html.substring(0, headIdx + 6) + polyfill + html.substring(headIdx + 6)).toByteArray(Charsets.UTF_8)
         } else {
             bytes
         }
     }
 
-    private fun buildResponse(bytes: ByteArray, mime: String): WebResourceResponse {
-        val finalBytes = if (mime.startsWith("text/html")) injectPolyfill(bytes) else bytes
+    private fun downlevelLegacyJs(bytes: ByteArray): ByteArray {
+        var out = bytes.toString(Charsets.UTF_8)
+        out = out.replace(Regex("\\bcatch\\s*\\{"), "catch(__kioskErr){")
+        out = out.replace(
+            Regex("([A-Za-z_\\$][\\w\\$.]*)\\s*\\?\\?\\s*('[^']*'|\"[^\"]*\"|[A-Za-z0-9_\\$.]+)"),
+            "((__nc=\$1)!=null?__nc:\$2)"
+        )
+        out = out.replace(
+            Regex("([A-Za-z_\\$][\\w\\$.]*(?:\\([^()]*\\)|\\[[^\\]]+\\])*)\\?\\.\\[([^\\]]+)\\]"),
+            "((__oc=\$1)!=null?__oc[\$2]:undefined)"
+        )
+        out = out.replace(
+            Regex("([A-Za-z_\\$][\\w\\$.]*(?:\\([^()]*\\)|\\[[^\\]]+\\])*)\\?\\.([A-Za-z_\\$][\\w\\$]*)\\(([^()]*)\\)"),
+            "((__oc=\$1)!=null?__oc.\$2(\$3):undefined)"
+        )
+        out = out.replace(
+            Regex("([A-Za-z_\\$][\\w\\$.]*(?:\\([^()]*\\)|\\[[^\\]]+\\])*)\\?\\.([A-Za-z_\\$][\\w\\$]*)"),
+            "((__oc=\$1)!=null?__oc.\$2:undefined)"
+        )
+        return ("var __oc,__nc;\n" + out).toByteArray(Charsets.UTF_8)
+    }
+
+    private fun downlevelLegacyCss(bytes: ByteArray): ByteArray {
+        val css = bytes.toString(Charsets.UTF_8)
+        return css.replace(Regex("([0-9.]+)dvh"), "\$1vh").toByteArray(Charsets.UTF_8)
+    }
+
+    private fun buildResponse(bytes: ByteArray, mime: String, path: String): WebResourceResponse {
+        val isJs = mime.contains("javascript") || path.endsWith(".js") || path.contains("menu-data.php")
+        val isCss = mime.startsWith("text/css") || path.endsWith(".css")
+        val finalBytes = when {
+            mime.startsWith("text/html") -> injectPolyfill(bytes)
+            isJs && (chromeMajor == 0 || chromeMajor < 86) -> downlevelLegacyJs(bytes)
+            isCss && (chromeMajor == 0 || chromeMajor < 109) -> downlevelLegacyCss(bytes)
+            else -> bytes
+        }
         val headers = mapOf(
             "Cache-Control" to "no-store, no-cache, must-revalidate",
             "Pragma" to "no-cache",
@@ -461,6 +701,7 @@ private class OfflineMenuCache(
             path.endsWith(".webp") || path.contains("site-logo.php") -> "image/webp"
             path.endsWith(".jpg") || path.endsWith(".jpeg") -> "image/jpeg"
             path.endsWith(".svg") -> "image/svg+xml"
+            path.endsWith(".ico") -> "image/x-icon"
             else -> "text/plain"
         }
     }
@@ -498,6 +739,8 @@ fun KioskScreen(
     var lastLoadedUrl by remember { mutableStateOf(currentUrl) }
     var cachedCount by remember { mutableStateOf(0) }
 
+    val chromeMajor = remember { detectChromeMajor(context) }
+
     val appVersionLabel = remember {
         try {
             val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
@@ -507,19 +750,27 @@ fun KioskScreen(
                 @Suppress("DEPRECATION")
                 pInfo.versionCode.toLong()
             }
-            "v${pInfo.versionName ?: "2.0"} (Kod: $code)"
+            "v${pInfo.versionName ?: "2.0"} (Kod: $code) • Android ${Build.VERSION.RELEASE} • WebView ${if (chromeMajor > 0) "Chrome/$chromeMajor" else "?"}"
         } catch (_: Exception) {
-            "v2.0"
+            "v2.0 • Android ${Build.VERSION.RELEASE}"
         }
     }
 
     val offlineCache = remember {
-        OfflineMenuCache(context) { onlineNow ->
-            isOnline = onlineNow
-            if (!onlineNow) {
-                wasDisconnected = true
+        OfflineMenuCache(
+            context = context,
+            chromeMajor = chromeMajor,
+            onConnectionStatusChanged = { onlineNow ->
+                isOnline = onlineNow
+                if (!onlineNow) {
+                    wasDisconnected = true
+                }
+            },
+            onCoreError = { err ->
+                lastErrorReason = err
+                showInitialError = true
             }
-        }
+        )
     }
 
     LaunchedEffect(Unit) {
@@ -569,10 +820,8 @@ fun KioskScreen(
     LaunchedEffect(showInitialError) {
         while (showInitialError) {
             delay(8000)
-            if (isNetworkAvailable(context)) {
-                showInitialError = false
-                webViewRef?.loadUrl(targetUrl)
-            }
+            showInitialError = false
+            webViewRef?.loadUrl(targetUrl)
         }
     }
 
@@ -627,6 +876,23 @@ fun KioskScreen(
                             return super.shouldInterceptRequest(view, request)
                         }
 
+                        @SuppressLint("WebViewClientOnReceivedSslError")
+                        override fun onReceivedSslError(
+                            view: WebView?,
+                            handler: SslErrorHandler?,
+                            error: SslError?
+                        ) {
+                            val errHost = try { Uri.parse(error?.url ?: "").host?.lowercase() ?: "" } catch (_: Exception) { "" }
+                            if (errHost.endsWith("simitcay.online") &&
+                                error?.primaryError == SslError.SSL_UNTRUSTED &&
+                                KioskTlsHelper.simitcayVerifiedByOkHttp
+                            ) {
+                                handler?.proceed()
+                            } else {
+                                handler?.cancel()
+                            }
+                        }
+
                         override fun onReceivedError(
                             view: WebView?,
                             request: WebResourceRequest?,
@@ -648,7 +914,7 @@ fun KioskScreen(
                                         )
                                     }
                                 } else {
-                                    lastErrorReason = error?.description?.toString() ?: "ERR_TIMED_OUT"
+                                    lastErrorReason = lastErrorReason ?: error?.description?.toString() ?: "ERR_TIMED_OUT"
                                     showInitialError = true
                                 }
                             }
@@ -661,9 +927,11 @@ fun KioskScreen(
                                 !url.startsWith("chrome-error://") &&
                                 !url.startsWith("data:")
                             ) {
-                                hasLoadedOnce = true
-                                showInitialError = false
-                                lastErrorReason = null
+                                if (offlineCache.lastMainFrameLoaded) {
+                                    hasLoadedOnce = true
+                                    showInitialError = false
+                                    lastErrorReason = null
+                                }
                                 cachedCount = offlineCache.cachedFileCount()
                             }
                         }
