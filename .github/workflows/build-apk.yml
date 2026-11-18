@@ -3,7 +3,10 @@ name: Kiosk APK Derleyici
 on:
   push:
     branches: [ "main", "master" ]
-  workflow_dispatch: # İstediğiniz an tek tıkla elle başlatabilmeniz için
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -13,6 +16,33 @@ jobs:
     - name: Depoyu İndir
       uses: actions/checkout@v4
 
+    - name: SimitCay Logosunu Doğrula
+      run: |
+        if [ -f app/src/main/res/drawable-nodpi/ic_launcher_fg.png ]; then
+          echo "Ozel SimitCay logo ikonlari hazir, korunuyor."
+        else
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3-pil
+          curl -fsSL "https://www.simitcay.online/site-logo.php" -o /tmp/simitcay-logo.webp
+          rm -f app/src/main/res/mipmap-*/ic_launcher*.webp
+          python3 - <<'EOF'
+          import os
+          from PIL import Image, ImageDraw
+          resample = getattr(Image, "Resampling", Image).LANCZOS
+          logo = Image.open("/tmp/simitcay-logo.webp").convert("RGBA")
+          bg_color = logo.getpixel((2, 2))
+          os.makedirs("app/src/main/res/drawable-nodpi", exist_ok=True)
+          Image.new("RGBA", (432, 432), bg_color).save("app/src/main/res/drawable-nodpi/ic_launcher_bg.png")
+          fg_img = Image.new("RGBA", (432, 432), (0, 0, 0, 0))
+          resized_fg = logo.resize((288, 288), resample)
+          fg_img.paste(resized_fg, (72, 72), resized_fg)
+          fg_img.save("app/src/main/res/drawable-nodpi/ic_launcher_fg.png")
+          for d, size in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
+              out_dir = f"app/src/main/res/mipmap-{d}"
+              os.makedirs(out_dir, exist_ok=True)
+              logo.resize((size, size), resample).save(f"{out_dir}/ic_launcher.png")
+          EOF
+        fi
+
     - name: Java 17 Kurulumu
       uses: actions/setup-java@v4
       with:
@@ -20,15 +50,37 @@ jobs:
         java-version: 17
         cache: 'gradle'
 
+    - name: Sabit İmza Dosyasını Doğrula
+      run: |
+        if [ -f app/kiosk-signing.jks ]; then
+          keytool -list -keystore app/kiosk-signing.jks -storepass SimitCayKiosk2026
+        fi
+
     - name: Çalıştırma İzni Ver
       run: chmod +x gradlew
 
     - name: APK Derle (assembleDebug)
       run: ./gradlew assembleDebug --stacktrace
 
+    - name: APK Dosyasını Yeniden Adlandır
+      run: |
+        APK_FILE=$(find app/build/outputs/apk/debug -maxdepth 1 -name "*.apk" | head -n 1)
+        mv "$APK_FILE" app/build/outputs/apk/debug/SimitCay-Menu.apk
+
     - name: APK Dosyasını İndirilebilir Yap
       uses: actions/upload-artifact@v4
       with:
-        name: restoran-kiosk-menu-apk
-        path: app/build/outputs/apk/debug/*.apk
+        name: SimitCay-Menu-apk
+        path: app/build/outputs/apk/debug/SimitCay-Menu.apk
         retention-days: 14
+
+    - name: Doğrudan APK Sürümü Yayınla (Release)
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG="v2.${GITHUB_RUN_NUMBER}"
+        gh release delete "$TAG" -y || true
+        gh release create "$TAG" app/build/outputs/apk/debug/SimitCay-Menu.apk \
+          --title "SimitCay Menu $TAG" \
+          --notes "Sabit imza ile silmeden güncelleme destekli derleme #${GITHUB_RUN_NUMBER}"

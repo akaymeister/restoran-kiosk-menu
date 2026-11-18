@@ -52,11 +52,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Dns
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.URL
 import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity() {
 
@@ -232,6 +238,20 @@ private class OfflineMenuCache(
     private val appContext = context.applicationContext
     private val cacheDir = File(context.filesDir, "offline_menu_cache").apply { mkdirs() }
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .dns(object : Dns {
+            override fun lookup(hostname: String): List<InetAddress> {
+                val addresses = Dns.SYSTEM.lookup(hostname)
+                return addresses.sortedBy { it !is Inet4Address }
+            }
+        })
+        .build()
 
     fun cachedFileCount(): Int {
         return cacheDir.listFiles { _, name -> name.endsWith(".bin") }?.size ?: 0
@@ -250,6 +270,19 @@ private class OfflineMenuCache(
         return File(cacheDir, hashKey(url) + ".bin").exists() ||
             File(cacheDir, hashKey(pathKey) + ".bin").exists() ||
             File(cacheDir, hashKey("https://www.simitcay.online/tablet.html") + ".bin").exists()
+    }
+
+    fun loadCachedHtml(url: String): String? {
+        val uri = Uri.parse(url)
+        val pathKey = "https://${uri.host ?: "www.simitcay.online"}${uri.path ?: "/tablet.html"}"
+        val candidates = listOf(url, pathKey, "https://www.simitcay.online/tablet.html")
+        for (candidate in candidates) {
+            val f = File(cacheDir, hashKey(candidate) + ".bin")
+            if (f.exists()) {
+                return injectPolyfill(f.readBytes()).toString(Charsets.UTF_8)
+            }
+        }
+        return null
     }
 
     fun shouldIntercept(request: WebResourceRequest): Boolean {
@@ -295,41 +328,39 @@ private class OfflineMenuCache(
         val onlineNow = isNetworkAvailable(appContext)
 
         if (onlineNow) {
-            var conn: HttpURLConnection? = null
             try {
-                conn = (URL(fullUrl).openConnection() as HttpURLConnection).apply {
-                    useCaches = false
-                    connectTimeout = 4000
-                    readTimeout = 8000
-                    instanceFollowRedirects = true
-                    setRequestProperty("Cache-Control", "no-cache, no-store, must-revalidate")
-                    setRequestProperty("Pragma", "no-cache")
-                    setRequestProperty(
+                val okReq = Request.Builder()
+                    .url(fullUrl)
+                    .header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    .header("Pragma", "no-cache")
+                    .header(
                         "User-Agent",
                         "Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
                     )
-                }
-                if (conn.responseCode in 200..299) {
-                    val bytes = conn.inputStream.readBytes()
-                    val mime = conn.contentType?.substringBefore(";")?.trim()
-                        ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
-                    save(exactKey, bytes, mime)
-                    if (isCoreMenuRequest || path.contains("site-logo.php")) {
-                        save(fallbackKey, bytes, mime)
+                    .build()
+                httpClient.newCall(okReq).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val bytes = resp.body?.bytes()
+                        if (bytes != null) {
+                            val mime = resp.header("Content-Type")?.substringBefore(";")?.trim()
+                                ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
+                            save(exactKey, bytes, mime)
+                            if (isCoreMenuRequest || path.contains("site-logo.php")) {
+                                save(fallbackKey, bytes, mime)
+                            }
+                            if (isCoreMenuRequest) {
+                                mainHandler.post { onConnectionStatusChanged(true) }
+                            }
+                            return buildResponse(bytes, mime)
+                        }
+                    } else if (isCoreMenuRequest) {
+                        mainHandler.post { onConnectionStatusChanged(false) }
                     }
-                    if (isCoreMenuRequest) {
-                        mainHandler.post { onConnectionStatusChanged(true) }
-                    }
-                    return buildResponse(bytes, mime)
-                } else if (isCoreMenuRequest) {
-                    mainHandler.post { onConnectionStatusChanged(false) }
                 }
             } catch (_: Exception) {
                 if (isCoreMenuRequest) {
                     mainHandler.post { onConnectionStatusChanged(false) }
                 }
-            } finally {
-                conn?.disconnect()
             }
         } else if (isCoreMenuRequest) {
             mainHandler.post { onConnectionStatusChanged(false) }
@@ -355,18 +386,18 @@ private class OfflineMenuCache(
         return buildResponse(bytes, mime)
     }
 
-    private fun buildResponse(bytes: ByteArray, mime: String): WebResourceResponse {
-        val finalBytes = if (mime.startsWith("text/html")) {
-            val polyfill = "<script>(function(){if(!Object.hasOwn){Object.hasOwn=function(o,p){return o!=null&&Object.prototype.hasOwnProperty.call(o,p);};}if(!String.prototype.replaceAll){String.prototype.replaceAll=function(s,r){if(s instanceof RegExp)return this.replace(s,r);var v=typeof r==='function'?r(String(s)):String(r);return this.split(String(s)).join(v);};}})();</script>"
-            val html = bytes.toString(Charsets.UTF_8)
-            if (!html.contains("Object.hasOwn=function") && html.contains("<head>")) {
-                html.replaceFirst("<head>", "<head>$polyfill").toByteArray(Charsets.UTF_8)
-            } else {
-                bytes
-            }
+    private fun injectPolyfill(bytes: ByteArray): ByteArray {
+        val polyfill = "<script>(function(){if(!Object.hasOwn){Object.hasOwn=function(o,p){return o!=null&&Object.prototype.hasOwnProperty.call(o,p);};}if(!String.prototype.replaceAll){String.prototype.replaceAll=function(s,r){if(s instanceof RegExp)return this.replace(s,r);var v=typeof r==='function'?r(String(s)):String(r);return this.split(String(s)).join(v);};}})();</script>"
+        val html = bytes.toString(Charsets.UTF_8)
+        return if (!html.contains("Object.hasOwn=function") && html.contains("<head>")) {
+            html.replaceFirst("<head>", "<head>$polyfill").toByteArray(Charsets.UTF_8)
         } else {
             bytes
         }
+    }
+
+    private fun buildResponse(bytes: ByteArray, mime: String): WebResourceResponse {
+        val finalBytes = if (mime.startsWith("text/html")) injectPolyfill(bytes) else bytes
         val headers = mapOf(
             "Cache-Control" to "no-store, no-cache, must-revalidate",
             "Pragma" to "no-cache",
@@ -417,6 +448,7 @@ fun KioskScreen(
     var wasDisconnected by remember { mutableStateOf(!isNetworkAvailable(context)) }
     var hasLoadedOnce by remember { mutableStateOf(false) }
     var showInitialError by remember { mutableStateOf(false) }
+    var lastErrorReason by remember { mutableStateOf<String?>(null) }
     var showAdminDialog by remember { mutableStateOf(false) }
     var targetUrl by remember { mutableStateOf(currentUrl) }
     var updateApkUrl by remember { mutableStateOf(currentUpdateUrl) }
@@ -558,11 +590,24 @@ fun KioskScreen(
                             error: WebResourceError?
                         ) {
                             super.onReceivedError(view, request, error)
-                            if (request?.isForMainFrame == true &&
-                                !hasLoadedOnce &&
-                                !offlineCache.hasCachedMenu(targetUrl)
-                            ) {
-                                showInitialError = true
+                            if (request?.isForMainFrame == true) {
+                                val cachedHtml = offlineCache.loadCachedHtml(targetUrl)
+                                if (cachedHtml != null) {
+                                    isOnline = false
+                                    showInitialError = false
+                                    view?.post {
+                                        view.loadDataWithBaseURL(
+                                            targetUrl,
+                                            cachedHtml,
+                                            "text/html",
+                                            "UTF-8",
+                                            targetUrl
+                                        )
+                                    }
+                                } else {
+                                    lastErrorReason = error?.description?.toString() ?: "ERR_TIMED_OUT"
+                                    showInitialError = true
+                                }
                             }
                         }
 
@@ -575,6 +620,7 @@ fun KioskScreen(
                             ) {
                                 hasLoadedOnce = true
                                 showInitialError = false
+                                lastErrorReason = null
                                 cachedCount = offlineCache.cachedFileCount()
                             }
                         }
@@ -608,18 +654,27 @@ fun KioskScreen(
                     Text(text = "📶", fontSize = 64.sp)
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
-                        text = "İnternet Bağlantısı Bekleniyor",
+                        text = "Sunucuya Bağlanılamadı",
                         fontSize = 22.sp,
                         fontWeight = FontWeight.Bold,
                         color = Color.White
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "İlk kurulum için internet bağlantısı gerekiyor. Wi-Fi bağlandığında menü otomatik açılacaktır.",
+                        text = "simitcay.online sunucusuna şu an ulaşılamıyor (8 saniyede bir otomatik tekrar denenir).",
                         fontSize = 14.sp,
                         color = Color(0xFFCBD5E1),
                         textAlign = TextAlign.Center
                     )
+                    if (!lastErrorReason.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "Hata: $lastErrorReason",
+                            fontSize = 11.sp,
+                            color = Color(0xFFFBBF24),
+                            textAlign = TextAlign.Center
+                        )
+                    }
                     Spacer(modifier = Modifier.height(24.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Button(
