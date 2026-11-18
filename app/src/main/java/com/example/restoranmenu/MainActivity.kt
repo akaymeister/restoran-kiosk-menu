@@ -196,15 +196,13 @@ class MainActivity : ComponentActivity() {
         return super.dispatchTouchEvent(ev)
     }
 
-    override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
-        if (event != null) {
-            lastInteractionElapsedMs = SystemClock.elapsedRealtime()
-            if (isScreenSleepingState) {
-                if (event.action == KeyEvent.ACTION_DOWN) {
-                    setScreenSleeping(false)
-                }
-                return true
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        lastInteractionElapsedMs = SystemClock.elapsedRealtime()
+        if (isScreenSleepingState) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                setScreenSleeping(false)
             }
+            return true
         }
         return super.dispatchKeyEvent(event)
     }
