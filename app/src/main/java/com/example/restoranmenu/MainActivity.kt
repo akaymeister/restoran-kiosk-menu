@@ -622,7 +622,29 @@ private fun createResilientOkHttpClient(
                     val raw = CookieManager.getInstance().getCookie(url.toString()) ?: return emptyList()
                     raw.split(";").mapNotNull { part ->
                         val trimmed = part.trim()
-                        if (trimmed.isEmpty()) null else Cookie.parse(url, trimmed)
+                        if (trimmed.isEmpty()) {
+                            null
+                        } else {
+                            Cookie.parse(url, trimmed) ?: run {
+                                val eq = trimmed.indexOf('=')
+                                if (eq > 0) {
+                                    val name = trimmed.substring(0, eq).trim()
+                                    val value = trimmed.substring(eq + 1).trim()
+                                    try {
+                                        Cookie.Builder()
+                                            .name(name)
+                                            .value(value)
+                                            .domain(url.host)
+                                            .path("/")
+                                            .build()
+                                    } catch (_: Exception) {
+                                        null
+                                    }
+                                } else {
+                                    null
+                                }
+                            }
+                        }
                     }
                 } catch (_: Exception) {
                     emptyList()
@@ -678,6 +700,20 @@ private class OfflineMenuCache(
         private set
     @Volatile var lastSubresourceError: String? = null
         private set
+    @Volatile var lastWasSecurityChallenge: Boolean = false
+        private set
+    @Volatile private var challengePassThroughUntilMs: Long = 0L
+
+    fun isChallengePassThroughActive(): Boolean =
+        SystemClock.elapsedRealtime() < challengePassThroughUntilMs
+
+    fun activateChallengePassThrough(durationMs: Long = 120_000L) {
+        challengePassThroughUntilMs = SystemClock.elapsedRealtime() + durationMs
+    }
+
+    fun clearChallengePassThrough() {
+        challengePassThroughUntilMs = 0L
+    }
 
     companion object {
         private const val KEY_SYNC_TAG = "sync_tag_v1"
@@ -753,6 +789,20 @@ private class OfflineMenuCache(
         }
     }
 
+    private fun isSecurityChallengeHtml(bytes: ByteArray?): Boolean {
+        if (bytes == null || bytes.isEmpty()) return false
+        val head = bytes.copyOfRange(0, minOf(bytes.size, 4096)).toString(Charsets.UTF_8).lowercase()
+        return head.contains("bir dakika bekleyin") ||
+            head.contains("just a moment") ||
+            head.contains("checking your browser") ||
+            head.contains("imunify360") ||
+            head.contains("cf-browser-verification") ||
+            head.contains("challenge-platform") ||
+            head.contains("__cf_chl_") ||
+            head.contains("turnstile") ||
+            head.contains("captcha")
+    }
+
     private fun describeInvalidPayload(path: String, bytes: ByteArray?): String {
         if (bytes == null || bytes.isEmpty()) return "Boş yanıt (0B)"
         val shortPath = path.substringAfterLast('/').ifBlank { "sayfa" }
@@ -811,6 +861,7 @@ private class OfflineMenuCache(
     }
 
     fun shouldIntercept(request: WebResourceRequest): Boolean {
+        if (isChallengePassThroughActive()) return false
         if (request.method != "GET") return false
         val uri = request.url ?: return false
         val host = uri.host?.lowercase() ?: return false
@@ -855,19 +906,30 @@ private class OfflineMenuCache(
             try {
                 val okReq = buildBrowserRequest(fullUrl, path)
                 httpClient.newCall(okReq).execute().use { resp ->
+                    if (host.endsWith("simitcay.online")) {
+                        KioskTlsHelper.simitcayVerifiedByOkHttp = true
+                    }
                     if (resp.isSuccessful) {
                         val bytes = resp.body?.bytes()
                         if (bytes != null && isValidPayload(path, bytes)) {
-                            if (host.endsWith("simitcay.online")) {
-                                KioskTlsHelper.simitcayVerifiedByOkHttp = true
-                            }
                             val mime = resp.header("Content-Type")?.substringBefore(";")?.trim()
                                 ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
                             return Pair(Pair(bytes, mime), null)
                         } else {
+                            if (isSecurityChallengeHtml(bytes)) {
+                                lastWasSecurityChallenge = true
+                                lastErr = describeInvalidPayload(path, bytes)
+                                return Pair(null, lastErr)
+                            }
                             lastErr = describeInvalidPayload(path, bytes)
                         }
                     } else {
+                        val errBytes = try { resp.body?.bytes() } catch (_: Exception) { null }
+                        if (resp.code in listOf(403, 429, 503) && isSecurityChallengeHtml(errBytes)) {
+                            lastWasSecurityChallenge = true
+                            lastErr = "Güvenlik doğrulaması (HTTP ${resp.code})"
+                            return Pair(null, lastErr)
+                        }
                         lastErr = "HTTP ${resp.code}"
                     }
                 }
@@ -911,6 +973,7 @@ private class OfflineMenuCache(
      */
     fun syncInBackgroundIfNeeded(force: Boolean = false): Boolean {
         if (!isNetworkAvailable(appContext) && !force) return false
+        if (isChallengePassThroughActive() && !force) return false
         if (!isSyncing.compareAndSet(false, true)) return false
         try {
             val localVersion = currentSyncVersion()
@@ -1186,6 +1249,9 @@ private class OfflineMenuCache(
         }
 
         var lastErrMsg: String? = null
+        if (request.isForMainFrame) {
+            lastWasSecurityChallenge = false
+        }
         if (onlineNow || cachedBefore == null) {
             val attempts = if (isCoreAsset) 2 else 1
             val (result, err) = fetchValidatedFromNetwork(fullUrl, path, maxAttempts = attempts)
@@ -1225,6 +1291,13 @@ private class OfflineMenuCache(
         }
 
         if (request.isForMainFrame) {
+            // Cloudflare / Imunify360 / LiteSpeed "Bir dakika bekleyin..." JS doğrulaması algılandıysa
+            // WebView'in kendi Chromium motoruyla doğrulamayı geçip çerez almasına izin ver.
+            if (lastWasSecurityChallenge) {
+                lastMainFrameLoaded = false
+                activateChallengePassThrough(120_000L)
+                return null
+            }
             lastMainFrameLoaded = false
             val err = lastErrMsg ?: if (!onlineNow) "İnternet bağlantısı yok (Çevrimdışı önbellek henüz tam değil)" else "Sunucuya erişilemedi"
             mainHandler.post { onCoreError(err) }
@@ -1602,6 +1675,12 @@ fun KioskScreen(
                     settings.loadWithOverviewMode = true
                     settings.displayZoomControls = false
                     settings.setSupportZoom(false)
+                    try {
+                        val cm = CookieManager.getInstance()
+                        cm.setAcceptCookie(true)
+                        cm.setAcceptThirdPartyCookies(this, true)
+                    } catch (_: Exception) {
+                    }
 
                     webChromeClient = object : WebChromeClient() {
                         override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
@@ -1621,6 +1700,15 @@ fun KioskScreen(
                             val uri = request.url ?: return false
                             val host = uri.host?.lowercase() ?: return true
                             val path = uri.path?.lowercase() ?: ""
+                            if (offlineCache.isChallengePassThroughActive()) {
+                                val allowedChallengeHost = host.endsWith("simitcay.online") ||
+                                    host.endsWith("cloudflare.com") ||
+                                    host.endsWith("hcaptcha.com") ||
+                                    host.endsWith("recaptcha.net") ||
+                                    host.endsWith("gstatic.com") ||
+                                    host.endsWith("google.com")
+                                return !allowedChallengeHost
+                            }
                             if (host.endsWith("simitcay.online") && path.contains("tablet.html")) {
                                 return false
                             }
@@ -1692,7 +1780,35 @@ fun KioskScreen(
                                 !url.startsWith("chrome-error://") &&
                                 !url.startsWith("data:")
                             ) {
-                                if (offlineCache.lastMainFrameLoaded) {
+                                // Güvenlik doğrulaması ("Bir dakika bekleyin...") geçildiyse çerezi kaydet ve önbelleği doldur
+                                if (offlineCache.isChallengePassThroughActive()) {
+                                    view?.postDelayed({
+                                        view.evaluateJavascript(
+                                            "(function(){var g=document.getElementById('gate'),b=document.getElementById('board'),i=document.getElementById('intro');if(!g)return 'CHALLENGE';var ok=(g.children.length>0)||(b&&!b.hidden)||(i&&!i.hidden);return ok?'MENU_OK':'MENU_NEED_POLYFILL';})()"
+                                        ) { raw ->
+                                            val clean = raw?.trim('"') ?: ""
+                                            if (clean == "MENU_OK" || clean == "MENU_NEED_POLYFILL") {
+                                                try {
+                                                    CookieManager.getInstance().flush()
+                                                } catch (_: Exception) {
+                                                }
+                                                offlineCache.clearChallengePassThrough()
+                                                hasLoadedOnce = true
+                                                showInitialError = false
+                                                lastErrorReason = null
+                                                kioskScope.launch {
+                                                    val synced = withContext(Dispatchers.IO) {
+                                                        offlineCache.syncInBackgroundIfNeeded(force = true)
+                                                    }
+                                                    cachedCount = offlineCache.cachedFileCount()
+                                                    if (clean == "MENU_NEED_POLYFILL" && (synced || offlineCache.hasCompleteOfflineBundle())) {
+                                                        view.loadUrl(targetUrl)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }, 2000)
+                                } else if (offlineCache.lastMainFrameLoaded) {
                                     hasLoadedOnce = true
                                     showInitialError = false
                                     lastErrorReason = null
