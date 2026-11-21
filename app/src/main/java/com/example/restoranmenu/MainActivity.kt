@@ -690,7 +690,7 @@ private class OfflineMenuCache(
         val trimmed = sample.trimStart()
         return when {
             lowPath.endsWith("tablet.html") ->
-                sample.contains("id="gate"") || sample.contains("id='gate'")
+                sample.contains("id=\"gate\"") || sample.contains("id='gate'")
             lowPath.contains("menu-data.php") ->
                 !trimmed.startsWith("<") && sample.contains("MENU_DATA")
             lowPath.endsWith("menu-ui.js") ->
