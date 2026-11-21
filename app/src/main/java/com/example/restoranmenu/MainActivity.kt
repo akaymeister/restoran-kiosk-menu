@@ -680,7 +680,8 @@ private class OfflineMenuCache(
     context: Context,
     private val chromeMajor: Int,
     private val onConnectionStatusChanged: (Boolean) -> Unit,
-    private val onCoreError: (String) -> Unit
+    private val onCoreError: (String) -> Unit,
+    private val onChallengeModeChanged: (Boolean) -> Unit
 ) {
     private val appContext = context.applicationContext
     private val cacheDir = File(context.filesDir, "offline_menu_cache").apply { mkdirs() }
@@ -707,12 +708,14 @@ private class OfflineMenuCache(
     fun isChallengePassThroughActive(): Boolean =
         SystemClock.elapsedRealtime() < challengePassThroughUntilMs
 
-    fun activateChallengePassThrough(durationMs: Long = 120_000L) {
+    fun activateChallengePassThrough(durationMs: Long = 180_000L) {
         challengePassThroughUntilMs = SystemClock.elapsedRealtime() + durationMs
+        mainHandler.post { onChallengeModeChanged(true) }
     }
 
     fun clearChallengePassThrough() {
         challengePassThroughUntilMs = 0L
+        mainHandler.post { onChallengeModeChanged(false) }
     }
 
     companion object {
@@ -790,17 +793,16 @@ private class OfflineMenuCache(
     }
 
     private fun isSecurityChallengeHtml(bytes: ByteArray?): Boolean {
-        if (bytes == null || bytes.isEmpty()) return false
-        val head = bytes.copyOfRange(0, minOf(bytes.size, 4096)).toString(Charsets.UTF_8).lowercase()
-        return head.contains("bir dakika bekleyin") ||
-            head.contains("just a moment") ||
-            head.contains("checking your browser") ||
-            head.contains("imunify360") ||
-            head.contains("cf-browser-verification") ||
-            head.contains("challenge-platform") ||
-            head.contains("__cf_chl_") ||
-            head.contains("turnstile") ||
-            head.contains("captcha")
+        if (bytes == null || bytes.size < 100) return false
+        val head = bytes.copyOfRange(0, minOf(bytes.size, 4096))
+            .toString(Charsets.UTF_8)
+            .lowercase(java.util.Locale.ROOT)
+        return head.contains("<!doctype") ||
+            head.contains("<html") ||
+            head.contains("<head") ||
+            head.contains("<title") ||
+            head.contains("<script") ||
+            head.contains("<body")
     }
 
     private fun describeInvalidPayload(path: String, bytes: ByteArray?): String {
@@ -1291,11 +1293,11 @@ private class OfflineMenuCache(
         }
 
         if (request.isForMainFrame) {
-            // Cloudflare / Imunify360 / LiteSpeed "Bir dakika bekleyin..." JS doğrulaması algılandıysa
-            // WebView'in kendi Chromium motoruyla doğrulamayı geçip çerez almasına izin ver.
+            // Menü dışı HTML ara sayfası (Cloudflare / Imunify360 / LiteSpeed "Bir dakika bekleyin..." vb.)
+            // algılandıysa WebView'in kendi Chromium motoruyla doğrulamayı geçip çerez almasına izin ver.
             if (lastWasSecurityChallenge) {
                 lastMainFrameLoaded = false
-                activateChallengePassThrough(120_000L)
+                activateChallengePassThrough(180_000L)
                 return null
             }
             lastMainFrameLoaded = false
@@ -1482,6 +1484,7 @@ fun KioskScreen(
     var cachedCount by remember { mutableStateOf(0) }
     var batteryPercent by remember { mutableStateOf(-1) }
     var isCharging by remember { mutableStateOf(false) }
+    var isChallengeMode by remember { mutableStateOf(false) }
 
     val chromeMajor = remember { detectChromeMajor(context) }
 
@@ -1513,6 +1516,12 @@ fun KioskScreen(
             onCoreError = { err ->
                 lastErrorReason = err
                 showInitialError = true
+            },
+            onChallengeModeChanged = { active ->
+                isChallengeMode = active
+                if (active) {
+                    showInitialError = false
+                }
             }
         )
     }
@@ -1737,7 +1746,6 @@ fun KioskScreen(
                         ) {
                             val errHost = try { Uri.parse(error?.url ?: "").host?.lowercase() ?: "" } catch (_: Exception) { "" }
                             if (errHost.endsWith("simitcay.online") &&
-                                error?.primaryError == SslError.SSL_UNTRUSTED &&
                                 KioskTlsHelper.simitcayVerifiedByOkHttp
                             ) {
                                 handler?.proceed()
@@ -1782,8 +1790,8 @@ fun KioskScreen(
                             ) {
                                 // Güvenlik doğrulaması ("Bir dakika bekleyin...") geçildiyse çerezi kaydet ve önbelleği doldur
                                 if (offlineCache.isChallengePassThroughActive()) {
-                                    view?.postDelayed({
-                                        view.evaluateJavascript(
+                                    val checkMenuAfterChallenge = {
+                                        view?.evaluateJavascript(
                                             "(function(){var g=document.getElementById('gate'),b=document.getElementById('board'),i=document.getElementById('intro');if(!g)return 'CHALLENGE';var ok=(g.children.length>0)||(b&&!b.hidden)||(i&&!i.hidden);return ok?'MENU_OK':'MENU_NEED_POLYFILL';})()"
                                         ) { raw ->
                                             val clean = raw?.trim('"') ?: ""
@@ -1807,7 +1815,13 @@ fun KioskScreen(
                                                 }
                                             }
                                         }
-                                    }, 2000)
+                                    }
+                                    view?.postDelayed({ checkMenuAfterChallenge() }, 2000)
+                                    view?.postDelayed({
+                                        if (offlineCache.isChallengePassThroughActive()) {
+                                            checkMenuAfterChallenge()
+                                        }
+                                    }, 6000)
                                 } else if (offlineCache.lastMainFrameLoaded) {
                                     hasLoadedOnce = true
                                     showInitialError = false
@@ -1914,6 +1928,7 @@ fun KioskScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Button(
                             onClick = {
+                                offlineCache.clearChallengePassThrough()
                                 showInitialError = false
                                 webViewRef?.loadUrl(targetUrl)
                             },
@@ -1932,7 +1947,22 @@ fun KioskScreen(
             }
         }
 
-        if (!isOnline && !showInitialError && !isScreenSleeping) {
+        if (isChallengeMode && !showInitialError && !isScreenSleeping) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(12.dp)
+                    .background(Color(0xDD0F172A), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 10.dp, vertical = 5.dp)
+            ) {
+                Text(
+                    text = "Güvenlik doğrulaması geçiliyor...",
+                    color = Color(0xFF38BDF8),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        } else if (!isOnline && !showInitialError && !isScreenSleeping) {
             Box(
                 modifier = Modifier
                     .align(Alignment.TopStart)
