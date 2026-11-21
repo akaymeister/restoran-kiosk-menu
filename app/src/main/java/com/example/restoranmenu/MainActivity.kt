@@ -1084,7 +1084,7 @@ fun KioskScreen(
 
     LaunchedEffect(showInitialError) {
         while (showInitialError) {
-            delay(8000)
+            delay(60_000L)
             showInitialError = false
             webViewRef?.loadUrl(targetUrl)
         }
@@ -1257,7 +1257,7 @@ fun KioskScreen(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "simitcay.online sunucusuna şu an ulaşılamıyor (8 saniyede bir otomatik tekrar denenir).",
+                        text = "simitcay.online sunucusuna şu an ulaşılamıyor (60 saniyede bir otomatik tekrar denenir).",
                         fontSize = 14.sp,
                         color = Color(0xFFCBD5E1),
                         textAlign = TextAlign.Center
