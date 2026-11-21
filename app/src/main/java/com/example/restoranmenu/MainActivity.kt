@@ -621,9 +621,10 @@ private fun createResilientOkHttpClient(
 }
 
 /**
- * Sunucudan "no-store" gelse bile tablet.html, JS, CSS, menu-data.php ve görselleri
- * tabletin yerel hafızasına kaydeder. Eski Android 7-10 WebView uyumluluğu sağlar ve
- * internet kesildiğinde otomatik önbellekten sunar.
+ * Önbellek-Öncelikli (Cache-First) + Arka Plan Senkronizasyonlu Kiosk Önbelleği.
+ * - Çekirdek paket tamamsa menüyü diskten anında (0 ms) açar, zayıf Wi-Fi'de takılmaz.
+ * - İndirilen HTML/JS/CSS dosyalarını doğrulamadan önbelleğe yazmaz (bozuk/boş sayfa engeli).
+ * - Arka planda kiosk-sync.php veya api.php?action=menu (revision) kontrol edip değişiklik varsa sessizce günceller.
  */
 private class OfflineMenuCache(
     context: Context,
@@ -633,32 +634,96 @@ private class OfflineMenuCache(
 ) {
     private val appContext = context.applicationContext
     private val cacheDir = File(context.filesDir, "offline_menu_cache").apply { mkdirs() }
+    private val syncPrefs = appContext.getSharedPreferences("kiosk_sync_meta_v1", Context.MODE_PRIVATE)
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val httpClient = createResilientOkHttpClient(connectSec = 12, readSec = 20)
+    private val httpClient = createResilientOkHttpClient(connectSec = 10, readSec = 15)
     private val fontsClient = createResilientOkHttpClient(connectSec = 4, readSec = 5)
     @Volatile var lastMainFrameLoaded: Boolean = false
         private set
+    @Volatile var lastSubresourceError: String? = null
+        private set
 
-    fun cachedFileCount(): Int {
-        return cacheDir.listFiles { _, name -> name.endsWith(".bin") }?.size ?: 0
-    }
-
-    fun clearCache() {
-        try {
-            cacheDir.listFiles()?.forEach { it.delete() }
-        } catch (_: Exception) {
-        }
-    }
-
-    fun hasCompleteOfflineBundle(): Boolean {
-        val required = listOf(
+    companion object {
+        private const val KEY_SYNC_TAG = "sync_tag_v1"
+        private const val CANONICAL_HOST = "www.simitcay.online"
+        private val CORE_FALLBACK_URLS = listOf(
             "https://www.simitcay.online/tablet.html",
             "https://www.simitcay.online/menu-data.php",
             "https://www.simitcay.online/menu-ui.js",
             "https://www.simitcay.online/tablet.js",
             "https://www.simitcay.online/tablet.css"
         )
-        return required.all { File(cacheDir, hashKey(it) + ".bin").exists() }
+    }
+
+    fun cachedFileCount(): Int {
+        return cacheDir.listFiles { _, name -> name.endsWith(".bin") }?.size ?: 0
+    }
+
+    fun currentSyncTag(): String = syncPrefs.getString(KEY_SYNC_TAG, "") ?: ""
+
+    fun clearCache() {
+        try {
+            cacheDir.listFiles()?.forEach { it.delete() }
+            syncPrefs.edit().remove(KEY_SYNC_TAG).apply()
+            lastSubresourceError = null
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun canonicalFallbackUrl(uri: Uri): String {
+        val rawHost = uri.host?.lowercase() ?: CANONICAL_HOST
+        val normHost = if (rawHost == "simitcay.online" || rawHost == "www.simitcay.online") CANONICAL_HOST else rawHost
+        val path = uri.path?.takeIf { it.isNotBlank() } ?: "/tablet.html"
+        val action = uri.getQueryParameter("action")
+        return if (action != null) {
+            "https://$normHost$path?action=$action"
+        } else {
+            "https://$normHost$path"
+        }
+    }
+
+    private fun isValidPayload(path: String, bytes: ByteArray): Boolean {
+        if (bytes.isEmpty()) return false
+        val lowPath = path.lowercase()
+        val headLen = minOf(bytes.size, 8192)
+        val sample = bytes.copyOfRange(0, headLen).toString(Charsets.UTF_8)
+        val trimmed = sample.trimStart()
+        return when {
+            lowPath.endsWith("tablet.html") ->
+                sample.contains("id="gate"") || sample.contains("id='gate'")
+            lowPath.contains("menu-data.php") ->
+                !trimmed.startsWith("<") && sample.contains("MENU_DATA")
+            lowPath.endsWith("menu-ui.js") ->
+                !trimmed.startsWith("<") && sample.contains("menuUnitLabel")
+            lowPath.endsWith("tablet.js") ->
+                !trimmed.startsWith("<") && sample.contains("renderGate")
+            lowPath.endsWith(".js") ->
+                !trimmed.startsWith("<")
+            lowPath.endsWith(".css") ->
+                !trimmed.startsWith("<!doctype", ignoreCase = true) &&
+                    !trimmed.startsWith("<html", ignoreCase = true)
+            lowPath.contains("api.php") ->
+                trimmed.startsWith("{") || trimmed.startsWith("[")
+            lowPath.endsWith(".png") || lowPath.endsWith(".jpg") || lowPath.endsWith(".jpeg") || lowPath.endsWith(".webp") || lowPath.contains("site-logo.php") ->
+                bytes.size >= 64 &&
+                    !trimmed.startsWith("<!doctype", ignoreCase = true) &&
+                    !trimmed.startsWith("<html", ignoreCase = true)
+            else -> true
+        }
+    }
+
+    fun hasCompleteOfflineBundle(): Boolean {
+        return CORE_FALLBACK_URLS.all { url ->
+            val key = hashKey(url)
+            val f = File(cacheDir, "$key.bin")
+            if (!f.exists() || f.length() <= 0L) return@all false
+            val p = Uri.parse(url).path ?: ""
+            try {
+                isValidPayload(p, f.readBytes())
+            } catch (_: Exception) {
+                false
+            }
+        }
     }
 
     fun hasCachedMenu(url: String): Boolean {
@@ -668,13 +733,16 @@ private class OfflineMenuCache(
     fun loadCachedHtml(url: String): String? {
         if (!hasCompleteOfflineBundle()) return null
         val uri = Uri.parse(url)
-        val pathKey = "https://${uri.host ?: "www.simitcay.online"}${uri.path ?: "/tablet.html"}"
+        val pathKey = canonicalFallbackUrl(uri)
         val candidates = listOf(url, pathKey, "https://www.simitcay.online/tablet.html")
         for (candidate in candidates) {
             val f = File(cacheDir, hashKey(candidate) + ".bin")
             if (f.exists()) {
-                lastMainFrameLoaded = true
-                return injectPolyfill(f.readBytes()).toString(Charsets.UTF_8)
+                val raw = f.readBytes()
+                if (isValidPayload("/tablet.html", raw)) {
+                    lastMainFrameLoaded = true
+                    return injectPolyfill(raw).toString(Charsets.UTF_8)
+                }
             }
         }
         return null
@@ -691,31 +759,205 @@ private class OfflineMenuCache(
         return true
     }
 
+    private fun fetchValidatedFromNetwork(
+        fullUrl: String,
+        path: String,
+        maxAttempts: Int
+    ): Pair<Pair<ByteArray, String>?, String?> {
+        var lastErr: String? = null
+        val uri = Uri.parse(fullUrl)
+        val host = uri.host?.lowercase() ?: ""
+        for (attempt in 1..maxAttempts) {
+            try {
+                val okReq = Request.Builder()
+                    .url(fullUrl)
+                    .header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    .header("Pragma", "no-cache")
+                    .header(
+                        "User-Agent",
+                        "Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
+                    )
+                    .build()
+                httpClient.newCall(okReq).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val bytes = resp.body?.bytes()
+                        if (bytes != null && isValidPayload(path, bytes)) {
+                            if (host.endsWith("simitcay.online")) {
+                                KioskTlsHelper.simitcayVerifiedByOkHttp = true
+                            }
+                            val mime = resp.header("Content-Type")?.substringBefore(";")?.trim()
+                                ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
+                            return Pair(Pair(bytes, mime), null)
+                        } else {
+                            lastErr = "Geçersiz içerik (${bytes?.size ?: 0}B)"
+                        }
+                    } else {
+                        lastErr = "HTTP ${resp.code}"
+                    }
+                }
+            } catch (e: Exception) {
+                lastErr = "${e.javaClass.simpleName}: ${e.message ?: "Bağlantı hatası"}"
+            }
+            if (attempt < maxAttempts) {
+                try {
+                    Thread.sleep(600)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }
+        return Pair(null, lastErr)
+    }
+
+    private fun downloadAndCacheUrl(url: String, saveAsFallback: Boolean = true): ByteArray? {
+        val uri = Uri.parse(url)
+        val path = uri.path?.lowercase() ?: ""
+        val (result, err) = fetchValidatedFromNetwork(url, path, maxAttempts = 2)
+        if (result != null) {
+            val (bytes, mime) = result
+            save(hashKey(url), bytes, mime)
+            if (saveAsFallback) {
+                save(hashKey(canonicalFallbackUrl(uri)), bytes, mime)
+            }
+            return bytes
+        }
+        if (err != null) {
+            val shortName = path.substringAfterLast('/').ifBlank { "dosya" }
+            lastSubresourceError = "$shortName: $err"
+        }
+        return null
+    }
+
+    /**
+     * Arka planda sürüm kontrolü yapar (önce kiosk-sync.php, yoksa api.php?action=menu revision).
+     * Değişiklik varsa veya çekirdek paket eksikse sessizce indirip önbelleği günceller.
+     */
+    fun syncInBackgroundIfNeeded(force: Boolean = false): Boolean {
+        if (!isNetworkAvailable(appContext) && !force) return false
+        var remoteTag: String? = null
+        val extraImageUrls = mutableListOf<String>()
+
+        // 1) Codex tarafından eklenecek kiosk-sync.php varsa önce onu dene
+        try {
+            val req = Request.Builder()
+                .url("https://$CANONICAL_HOST/kiosk-sync.php")
+                .header("Cache-Control", "no-cache, no-store")
+                .build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val body = resp.body?.string()?.trim() ?: ""
+                    if (body.startsWith("{")) {
+                        val json = JSONObject(body)
+                        val ver = json.optString("version", "")
+                        val upd = json.optString("updated_at", "")
+                        if (ver.isNotBlank()) {
+                            remoteTag = "sync:$ver:$upd"
+                            mainHandler.post { onConnectionStatusChanged(true) }
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        // 2) kiosk-sync.php henüz yoksa mevcut api.php?action=menu içindeki revision değerini kullan
+        if (remoteTag == null) {
+            try {
+                val req = Request.Builder()
+                    .url("https://$CANONICAL_HOST/api.php?action=menu")
+                    .header("Cache-Control", "no-cache, no-store")
+                    .build()
+                httpClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val bytes = resp.body?.bytes()
+                        if (bytes != null && isValidPayload("/api.php", bytes)) {
+                            val body = bytes.toString(Charsets.UTF_8)
+                            val json = JSONObject(body)
+                            val rev = json.optLong("revision", -1L)
+                            if (rev >= 0L) {
+                                remoteTag = "rev:$rev"
+                            }
+                            save(hashKey("https://$CANONICAL_HOST/api.php?action=menu"), bytes, "application/json")
+                            mainHandler.post { onConnectionStatusChanged(true) }
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val bundleComplete = hasCompleteOfflineBundle()
+        val localTag = currentSyncTag()
+        val needsSync = force || !bundleComplete || (remoteTag != null && remoteTag != localTag)
+        if (!needsSync) return false
+
+        val htmlBytes = downloadAndCacheUrl("https://$CANONICAL_HOST/tablet.html", saveAsFallback = true)
+            ?: return false
+        val html = htmlBytes.toString(Charsets.UTF_8)
+
+        // tablet.html içindeki gerçek ?v=... uzantılı script ve css adreslerini yakala
+        val urlsToSync = linkedSetOf(
+            "https://$CANONICAL_HOST/tablet.css",
+            "https://$CANONICAL_HOST/menu-data.php?v=lang-1",
+            "https://$CANONICAL_HOST/menu-ui.js",
+            "https://$CANONICAL_HOST/tablet.js",
+            "https://$CANONICAL_HOST/logo-client.js",
+            "https://$CANONICAL_HOST/waiter-button.js",
+            "https://$CANONICAL_HOST/site-logo.php"
+        )
+        val assetRegex = Regex("(?:src|href)=\"([^\"]+\\.(?:js|css|php)(?:\\?[^\"]*)?)\"")
+        assetRegex.findAll(html).forEach { m ->
+            val raw = m.groupValues.getOrNull(1)?.trim() ?: ""
+            if (raw.isNotEmpty() && !raw.startsWith("http://") && !raw.startsWith("https://") && !raw.startsWith("//") && !raw.contains("analytics.js")) {
+                urlsToSync.add("https://$CANONICAL_HOST/${raw.removePrefix("/")}")
+            }
+        }
+
+        var allCoreOk = true
+        for (assetUrl in urlsToSync) {
+            val res = downloadAndCacheUrl(assetUrl, saveAsFallback = true)
+            val low = assetUrl.lowercase()
+            if (res == null && (low.contains("menu-data.php") || low.contains("menu-ui.js") || low.contains("tablet.js") || low.contains("tablet.css"))) {
+                allCoreOk = false
+            }
+        }
+
+        for (imgUrl in extraImageUrls) {
+            downloadAndCacheUrl(imgUrl, saveAsFallback = false)
+        }
+
+        if (allCoreOk && hasCompleteOfflineBundle()) {
+            lastSubresourceError = null
+            if (remoteTag != null) {
+                syncPrefs.edit().putString(KEY_SYNC_TAG, remoteTag).apply()
+            }
+            return true
+        }
+        return false
+    }
+
     fun fetchOrServeCached(request: WebResourceRequest): WebResourceResponse? {
         val uri = request.url ?: return null
         val host = uri.host?.lowercase() ?: ""
         val fullUrl = uri.toString()
         val path = uri.path?.lowercase() ?: ""
-        val action = uri.getQueryParameter("action")
-        val fallbackUrl = if (action != null) {
-            "https://${uri.host ?: "www.simitcay.online"}${uri.path ?: ""}?action=$action"
-        } else {
-            "https://${uri.host ?: "www.simitcay.online"}${uri.path ?: "/tablet.html"}"
-        }
+        val fallbackUrl = canonicalFallbackUrl(uri)
         val exactKey = hashKey(fullUrl)
         val fallbackKey = hashKey(fallbackUrl)
         val isFontHost = host == "fonts.googleapis.com" || host == "fonts.gstatic.com"
-        val isCoreMenuRequest = !isFontHost && (
+        val isLiveApi = path.contains("api.php")
+        val isCoreAsset = !isFontHost && (
             request.isForMainFrame ||
             path.endsWith("tablet.html") ||
             path.contains("menu-data.php") ||
-            path.contains("api.php")
+            path.endsWith("menu-ui.js") ||
+            path.endsWith("tablet.js") ||
+            path.endsWith("tablet.css")
         )
         val cachedBefore = load(exactKey, path) ?: load(fallbackKey, path)
         val onlineNow = isNetworkAvailable(appContext)
-        var lastErrMsg: String? = null
 
-        // Google Fonts hızlı önbellekten veya ağdan çekilir; ulaşılamazsa sayfa çizimini kilitlememesi için boş CSS döner.
+        // Google Fonts her zaman önbellek öncelikli; erişilemezse sayfa çizimini asla kilitlemez.
         if (isFontHost) {
             if (cachedBefore != null) return cachedBefore
             if (onlineNow) {
@@ -724,7 +966,7 @@ private class OfflineMenuCache(
                     fontsClient.newCall(fontReq).execute().use { resp ->
                         if (resp.isSuccessful) {
                             val bytes = resp.body?.bytes()
-                            if (bytes != null) {
+                            if (bytes != null && bytes.isNotEmpty()) {
                                 val mime = resp.header("Content-Type")?.substringBefore(";")?.trim()
                                     ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
                                 save(exactKey, bytes, mime)
@@ -739,53 +981,45 @@ private class OfflineMenuCache(
             return WebResourceResponse(emptyMime, "UTF-8", 200, "OK", mapOf("Access-Control-Allow-Origin" to "*"), ByteArrayInputStream(ByteArray(0)))
         }
 
-        // İnternet görünüyorsa VEYA henüz önbellekte hiç kayıt yoksa ağdan dene (eski tabletlerde ConnectivityManager bazen false döner)
+        // CACHE-FIRST: Çekirdek paket tamsa ve bu canlı api.php isteği değilse önbellekten ANINDA (0 ms) sun.
+        // Güncellemeler arka plandaki senkronizasyon döngüsü tarafından sessizce indirilir.
+        if (!isLiveApi && cachedBefore != null && (!request.isForMainFrame || hasCompleteOfflineBundle())) {
+            if (request.isForMainFrame) {
+                lastMainFrameLoaded = true
+                lastSubresourceError = null
+            }
+            return cachedBefore
+        }
+
+        var lastErrMsg: String? = null
         if (onlineNow || cachedBefore == null) {
-            try {
-                val okReq = Request.Builder()
-                    .url(fullUrl)
-                    .header("Cache-Control", "no-cache, no-store, must-revalidate")
-                    .header("Pragma", "no-cache")
-                    .header(
-                        "User-Agent",
-                        "Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
-                    )
-                    .build()
-                httpClient.newCall(okReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val bytes = resp.body?.bytes()
-                        if (bytes != null) {
-                            if (host.endsWith("simitcay.online")) {
-                                KioskTlsHelper.simitcayVerifiedByOkHttp = true
-                            }
-                            if (request.isForMainFrame) {
-                                lastMainFrameLoaded = true
-                            }
-                            val mime = resp.header("Content-Type")?.substringBefore(";")?.trim()
-                                ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
-                            save(exactKey, bytes, mime)
-                            if (isCoreMenuRequest || path.endsWith(".js") || path.endsWith(".css") || path.contains("site-logo.php")) {
-                                save(fallbackKey, bytes, mime)
-                            }
-                            if (isCoreMenuRequest) {
-                                mainHandler.post { onConnectionStatusChanged(true) }
-                            }
-                            return buildResponse(bytes, mime, path)
-                        }
-                    } else {
-                        lastErrMsg = "HTTP ${resp.code}"
-                        if (isCoreMenuRequest) {
-                            mainHandler.post { onConnectionStatusChanged(false) }
-                        }
-                    }
+            val attempts = if (isCoreAsset) 2 else 1
+            val (result, err) = fetchValidatedFromNetwork(fullUrl, path, maxAttempts = attempts)
+            if (result != null) {
+                val (bytes, mime) = result
+                if (request.isForMainFrame) {
+                    lastMainFrameLoaded = true
+                    lastSubresourceError = null
                 }
-            } catch (e: Exception) {
-                lastErrMsg = "${e.javaClass.simpleName}: ${e.message ?: "Bağlantı hatası"}"
-                if (isCoreMenuRequest) {
+                save(exactKey, bytes, mime)
+                if (isCoreAsset || isLiveApi || path.endsWith(".js") || path.endsWith(".css") || path.contains("site-logo.php")) {
+                    save(fallbackKey, bytes, mime)
+                }
+                if (isCoreAsset || isLiveApi) {
+                    mainHandler.post { onConnectionStatusChanged(true) }
+                }
+                return buildResponse(bytes, mime, path)
+            } else {
+                lastErrMsg = err
+                if (isCoreAsset && !request.isForMainFrame && err != null) {
+                    val shortName = path.substringAfterLast('/').ifBlank { "script" }
+                    lastSubresourceError = "$shortName: $err"
+                }
+                if (isCoreAsset || isLiveApi) {
                     mainHandler.post { onConnectionStatusChanged(false) }
                 }
             }
-        } else if (isCoreMenuRequest) {
+        } else if (isCoreAsset || isLiveApi) {
             mainHandler.post { onConnectionStatusChanged(false) }
         }
 
@@ -808,7 +1042,13 @@ private class OfflineMenuCache(
 
     private fun save(key: String, bytes: ByteArray, mime: String) {
         try {
-            File(cacheDir, "$key.bin").writeBytes(bytes)
+            val tmpBin = File(cacheDir, "$key.bin.tmp")
+            val dstBin = File(cacheDir, "$key.bin")
+            tmpBin.writeBytes(bytes)
+            if (!tmpBin.renameTo(dstBin)) {
+                dstBin.writeBytes(bytes)
+                tmpBin.delete()
+            }
             File(cacheDir, "$key.mime").writeText(mime)
         } catch (_: Exception) {
         }
@@ -818,7 +1058,19 @@ private class OfflineMenuCache(
         val dataFile = File(cacheDir, "$key.bin")
         val mimeFile = File(cacheDir, "$key.mime")
         if (!dataFile.exists()) return null
-        val bytes = dataFile.readBytes()
+        val bytes = try {
+            dataFile.readBytes()
+        } catch (_: Exception) {
+            return null
+        }
+        if (path.isNotBlank() && !isValidPayload(path, bytes)) {
+            try {
+                dataFile.delete()
+                mimeFile.delete()
+            } catch (_: Exception) {
+            }
+            return null
+        }
         val mime = if (mimeFile.exists()) mimeFile.readText().trim() else "application/octet-stream"
         return buildResponse(bytes, mime, path)
     }
@@ -852,30 +1104,38 @@ private class OfflineMenuCache(
     }
 
     private fun downlevelLegacyJs(bytes: ByteArray): ByteArray {
-        var out = bytes.toString(Charsets.UTF_8)
-        out = out.replace(Regex("\\bcatch\\s*\\{"), "catch(__kioskErr){")
-        out = out.replace(
-            Regex("([A-Za-z_\\$][\\w\\$.]*)\\s*\\?\\?\\s*('[^']*'|\"[^\"]*\"|[A-Za-z0-9_\\$.]+)"),
-            "((__nc=\$1)!=null?__nc:\$2)"
-        )
-        out = out.replace(
-            Regex("([A-Za-z_\\$][\\w\\$.]*(?:\\([^()]*\\)|\\[[^\\]]+\\])*)\\?\\.\\[([^\\]]+)\\]"),
-            "((__oc=\$1)!=null?__oc[\$2]:undefined)"
-        )
-        out = out.replace(
-            Regex("([A-Za-z_\\$][\\w\\$.]*(?:\\([^()]*\\)|\\[[^\\]]+\\])*)\\?\\.([A-Za-z_\\$][\\w\\$]*)\\(([^()]*)\\)"),
-            "((__oc=\$1)!=null?__oc.\$2(\$3):undefined)"
-        )
-        out = out.replace(
-            Regex("([A-Za-z_\\$][\\w\\$.]*(?:\\([^()]*\\)|\\[[^\\]]+\\])*)\\?\\.([A-Za-z_\\$][\\w\\$]*)"),
-            "((__oc=\$1)!=null?__oc.\$2:undefined)"
-        )
-        return ("var __oc,__nc;\n" + out).toByteArray(Charsets.UTF_8)
+        return try {
+            var out = bytes.toString(Charsets.UTF_8)
+            out = out.replace(Regex("\\bcatch\\s*\\{"), "catch(__kioskErr){")
+            out = out.replace(
+                Regex("([A-Za-z_\\$][\\w\\$.]*)\\s*\\?\\?\\s*('[^']*'|\"[^\"]*\"|[A-Za-z0-9_\\$.]+)"),
+                "((__nc=\$1)!=null?__nc:\$2)"
+            )
+            out = out.replace(
+                Regex("([A-Za-z_\\$][\\w\\$.]*(?:\\([^()]*\\)|\\[[^\\]]+\\])*)\\?\\.\\[([^\\]]+)\\]"),
+                "((__oc=\$1)!=null?__oc[\$2]:undefined)"
+            )
+            out = out.replace(
+                Regex("([A-Za-z_\\$][\\w\\$.]*(?:\\([^()]*\\)|\\[[^\\]]+\\])*)\\?\\.([A-Za-z_\\$][\\w\\$]*)\\(([^()]*)\\)"),
+                "((__oc=\$1)!=null?__oc.\$2(\$3):undefined)"
+            )
+            out = out.replace(
+                Regex("([A-Za-z_\\$][\\w\\$.]*(?:\\([^()]*\\)|\\[[^\\]]+\\])*)\\?\\.([A-Za-z_\\$][\\w\\$]*)"),
+                "((__oc=\$1)!=null?__oc.\$2:undefined)"
+            )
+            ("var __oc,__nc;\n" + out).toByteArray(Charsets.UTF_8)
+        } catch (_: Exception) {
+            bytes
+        }
     }
 
     private fun downlevelLegacyCss(bytes: ByteArray): ByteArray {
-        val css = bytes.toString(Charsets.UTF_8)
-        return css.replace(Regex("([0-9.]+)dvh"), "\$1vh").toByteArray(Charsets.UTF_8)
+        return try {
+            val css = bytes.toString(Charsets.UTF_8)
+            css.replace(Regex("([0-9.]+)dvh"), "\$1vh").toByteArray(Charsets.UTF_8)
+        } catch (_: Exception) {
+            bytes
+        }
     }
 
     private fun buildResponse(bytes: ByteArray, mime: String, path: String): WebResourceResponse {
@@ -883,7 +1143,7 @@ private class OfflineMenuCache(
         val isCss = mime.startsWith("text/css") || path.endsWith(".css")
         val finalBytes = when {
             mime.startsWith("text/html") -> injectPolyfill(bytes)
-            isJs && (chromeMajor == 0 || chromeMajor < 86) -> downlevelLegacyJs(bytes)
+            isJs && (chromeMajor == 0 || chromeMajor < 90) -> downlevelLegacyJs(bytes)
             isCss && (chromeMajor == 0 || chromeMajor < 109) -> downlevelLegacyCss(bytes)
             else -> bytes
         }
@@ -937,6 +1197,7 @@ fun KioskScreen(
     onExitKioskMode: () -> Unit
 ) {
     val context = LocalContext.current
+    val kioskScope = rememberCoroutineScope()
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var isOnline by remember { mutableStateOf(isNetworkAvailable(context)) }
     var wasDisconnected by remember { mutableStateOf(!isNetworkAvailable(context)) }
@@ -944,6 +1205,8 @@ fun KioskScreen(
     var showInitialError by remember { mutableStateOf(false) }
     var lastErrorReason by remember { mutableStateOf<String?>(null) }
     var lastJsError by remember { mutableStateOf<String?>(null) }
+    var pendingBackgroundReload by remember { mutableStateOf(false) }
+    var emptyAutoRepairTried by remember { mutableStateOf(false) }
     var showAdminDialog by remember { mutableStateOf(false) }
     var targetUrl by remember { mutableStateOf(currentUrl) }
     var updateApkUrl by remember { mutableStateOf(currentUpdateUrl) }
@@ -989,6 +1252,36 @@ fun KioskScreen(
 
     LaunchedEffect(Unit) {
         cachedCount = offlineCache.cachedFileCount()
+        // Arka planda sürüm/değişiklik kontrolü (ilk kontrol 4 sn sonra, ardından 60 sn'de bir)
+        delay(4000)
+        while (true) {
+            val updated = withContext(Dispatchers.IO) {
+                try {
+                    offlineCache.syncInBackgroundIfNeeded(force = false)
+                } catch (_: Exception) {
+                    false
+                }
+            }
+            cachedCount = offlineCache.cachedFileCount()
+            if (updated) {
+                if (showInitialError || !hasLoadedOnce || isScreenSleeping) {
+                    showInitialError = false
+                    pendingBackgroundReload = false
+                    webViewRef?.loadUrl(targetUrl)
+                } else {
+                    pendingBackgroundReload = true
+                }
+            }
+            delay(60_000L)
+        }
+    }
+
+    // Bekleyen arka plan güncellemesini müşteri ekranı bıraktığında (uyku modunda) sessizce uygula
+    LaunchedEffect(isScreenSleeping, pendingBackgroundReload) {
+        if (isScreenSleeping && pendingBackgroundReload) {
+            pendingBackgroundReload = false
+            webViewRef?.loadUrl(targetUrl)
+        }
     }
 
     // Batarya seviyesi ve şarj durumunu canlı dinle
@@ -1206,16 +1499,40 @@ fun KioskScreen(
                                     lastErrorReason = null
                                     view?.postDelayed({
                                         view.evaluateJavascript(
-                                            "(function(){var g=document.getElementById('gate'),b=document.getElementById('board'),i=document.getElementById('intro');var ok=(g&&g.children.length>0)||(b&&!b.hidden)||(i&&!i.hidden);return (ok?'OK':'EMPTY')+'|'+(window.__kioskJsErr||'');})()"
+                                            "(function(){var g=document.getElementById('gate'),b=document.getElementById('board'),i=document.getElementById('intro');var ok=(g&&g.children.length>0)||(b&&!b.hidden)||(i&&!i.hidden);var st='M:'+(typeof MENU_DATA!=='undefined'?1:0)+' U:'+(typeof menuUnitLabel==='function'?1:0)+' G:'+(typeof renderGate==='function'?1:0);return (ok?'OK':'EMPTY')+'|'+st+'|'+(window.__kioskJsErr||'');})()"
                                         ) { raw ->
                                             val clean = raw?.trim('"') ?: ""
                                             if (clean.startsWith("EMPTY")) {
-                                                val jsErr = clean.substringAfter('|', "").ifBlank { lastJsError ?: "Menü scripti yüklenemedi" }
-                                                lastErrorReason = "Sayfa boş kaldı ($jsErr)"
-                                                showInitialError = true
+                                                val parts = clean.split('|')
+                                                val flags = parts.getOrNull(1) ?: ""
+                                                val jsErr = parts.getOrNull(2).orEmpty().ifBlank { lastJsError ?: "" }
+                                                val subErr = offlineCache.lastSubresourceError ?: ""
+                                                if (!emptyAutoRepairTried && isNetworkAvailable(context)) {
+                                                    emptyAutoRepairTried = true
+                                                    kioskScope.launch {
+                                                        val fixed = withContext(Dispatchers.IO) {
+                                                            offlineCache.syncInBackgroundIfNeeded(force = true)
+                                                        }
+                                                        cachedCount = offlineCache.cachedFileCount()
+                                                        if (fixed) {
+                                                            showInitialError = false
+                                                            view.loadUrl(targetUrl)
+                                                        } else {
+                                                            val detail = listOf(flags, jsErr, subErr).filter { it.isNotBlank() }.joinToString(" • ").ifBlank { "Menü scripti yüklenemedi" }
+                                                            lastErrorReason = "Sayfa boş kaldı ($detail)"
+                                                            showInitialError = true
+                                                        }
+                                                    }
+                                                } else {
+                                                    val detail = listOf(flags, jsErr, subErr).filter { it.isNotBlank() }.joinToString(" • ").ifBlank { "Menü scripti yüklenemedi" }
+                                                    lastErrorReason = "Sayfa boş kaldı ($detail)"
+                                                    showInitialError = true
+                                                }
+                                            } else if (clean.startsWith("OK")) {
+                                                emptyAutoRepairTried = false
                                             }
                                         }
-                                    }, 3500)
+                                    }, 5000)
                                 }
                                 cachedCount = offlineCache.cachedFileCount()
                             }
@@ -1387,12 +1704,21 @@ fun KioskScreen(
                 },
                 onSavePin = { onSavePin(it) },
                 onReload = {
-                    webViewRef?.clearCache(false)
-                    webViewRef?.loadUrl(targetUrl)
+                    kioskScope.launch {
+                        withContext(Dispatchers.IO) {
+                            offlineCache.syncInBackgroundIfNeeded(force = true)
+                        }
+                        cachedCount = offlineCache.cachedFileCount()
+                        showInitialError = false
+                        webViewRef?.clearCache(false)
+                        webViewRef?.loadUrl(targetUrl)
+                    }
                 },
                 onClearCacheAndReload = {
                     offlineCache.clearCache()
                     cachedCount = 0
+                    emptyAutoRepairTried = false
+                    showInitialError = false
                     webViewRef?.clearCache(true)
                     webViewRef?.loadUrl(targetUrl)
                 },
