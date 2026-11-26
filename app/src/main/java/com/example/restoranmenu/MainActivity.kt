@@ -690,6 +690,7 @@ private class OfflineMenuCache(
     private val httpClient = createResilientOkHttpClient(connectSec = 12, readSec = 30)
     private val fontsClient = createResilientOkHttpClient(connectSec = 4, readSec = 5)
     private val isSyncing = AtomicBoolean(false)
+    private val syncLock = Any()
     private val browserUserAgent: String = try {
         WebSettings.getDefaultUserAgent(appContext)
             .takeIf { it.isNotBlank() }
@@ -758,12 +759,21 @@ private class OfflineMenuCache(
         val rawHost = uri.host?.lowercase() ?: CANONICAL_HOST
         val normHost = if (rawHost == "simitcay.online" || rawHost == "www.simitcay.online") CANONICAL_HOST else rawHost
         val path = uri.path?.takeIf { it.isNotBlank() } ?: "/tablet.html"
-        val action = uri.getQueryParameter("action")
-        return if (action != null) {
-            "https://$normHost$path?action=$action"
+        val queryParts = mutableListOf<String>()
+        uri.getQueryParameter("action")?.takeIf { it.isNotBlank() }?.let { queryParts.add("action=$it") }
+        uri.getQueryParameter("icon")?.takeIf { it.isNotBlank() }?.let { queryParts.add("icon=$it") }
+        return if (queryParts.isNotEmpty()) {
+            "https://$normHost$path?${queryParts.joinToString("&")}"
         } else {
             "https://$normHost$path"
         }
+    }
+
+    private fun canonicalKeyForUrl(url: String): String = hashKey(canonicalFallbackUrl(Uri.parse(url)))
+
+    private fun appendCacheBuster(url: String): String {
+        val sep = if (url.contains("?")) "&" else "?"
+        return "$url${sep}_ts=${System.currentTimeMillis()}"
     }
 
     private fun isValidPayload(path: String, bytes: ByteArray): Boolean {
@@ -830,7 +840,7 @@ private class OfflineMenuCache(
     }
 
     private fun hasValidCachedFile(url: String): Boolean {
-        val f = File(cacheDir, hashKey(url) + ".bin")
+        val f = File(cacheDir, canonicalKeyForUrl(url) + ".bin")
         if (!f.exists() || f.length() <= 0L) return false
         val p = Uri.parse(url).path ?: ""
         return try {
@@ -850,11 +860,12 @@ private class OfflineMenuCache(
 
     fun loadCachedHtml(url: String): String? {
         if (!hasCompleteOfflineBundle()) return null
-        val uri = Uri.parse(url)
-        val pathKey = canonicalFallbackUrl(uri)
-        val candidates = listOf(url, pathKey, "https://www.simitcay.online/tablet.html")
-        for (candidate in candidates) {
-            val f = File(cacheDir, hashKey(candidate) + ".bin")
+        val candidates = listOf(
+            canonicalKeyForUrl(url),
+            canonicalKeyForUrl("https://www.simitcay.online/tablet.html")
+        ).distinct()
+        for (key in candidates) {
+            val f = File(cacheDir, "$key.bin")
             if (f.exists()) {
                 val raw = f.readBytes()
                 if (isValidPayload("/tablet.html", raw)) {
@@ -953,16 +964,14 @@ private class OfflineMenuCache(
         return Pair(null, lastErr)
     }
 
-    private fun downloadAndCacheUrl(url: String, saveAsFallback: Boolean = true): ByteArray? {
+    private fun downloadAndCacheUrl(url: String, cacheBust: Boolean = false): ByteArray? {
         val uri = Uri.parse(url)
         val path = uri.path?.lowercase() ?: ""
-        val (result, err) = fetchValidatedFromNetwork(url, path, maxAttempts = 2)
+        val fetchUrl = if (cacheBust) appendCacheBuster(url) else url
+        val (result, err) = fetchValidatedFromNetwork(fetchUrl, path, maxAttempts = 2)
         if (result != null) {
             val (bytes, mime) = result
-            save(hashKey(url), bytes, mime)
-            if (saveAsFallback) {
-                save(hashKey(canonicalFallbackUrl(uri)), bytes, mime)
-            }
+            save(canonicalKeyForUrl(url), bytes, mime)
             return bytes
         }
         if (err != null) {
@@ -973,284 +982,362 @@ private class OfflineMenuCache(
     }
 
     /**
-     * Arka planda sürüm kontrolü yapar (önce kiosk-sync.php + ?mode=manifest ile hash bazlı artımlı senkronizasyon;
-     * yoksa api.php?action=menu revision yedek akışı).
-     * Yalnızca değişen çekirdek dosyaları ve ürün görsellerini sessizce indirir.
+     * Arka planda veya yönetici acil güncellemesiyle sürüm kontrolü yapar (kiosk-sync.php + ?mode=manifest
+     * ile hash bazlı artımlı senkronizasyon; yoksa api.php?action=menu revision yedek akışı).
+     * Tüm simitcay.online dosyalarını tek bir kanonik anahtar altında saklar.
      */
-    fun syncInBackgroundIfNeeded(force: Boolean = false): Boolean {
-        if (!isNetworkAvailable(appContext) && !force) {
-            lastSyncStatus = "Çevrimdışı (ağ yok)"
-            return false
+    fun syncInBackgroundIfNeeded(
+        force: Boolean = false,
+        onProgress: ((String) -> Unit)? = null
+    ): Boolean {
+        if (!force) {
+            if (!isNetworkAvailable(appContext)) {
+                lastSyncStatus = "Çevrimdışı (ağ yok)"
+                return false
+            }
+            if (isChallengePassThroughActive()) return false
+            if (!isSyncing.compareAndSet(false, true)) return false
+            return synchronized(syncLock) {
+                try {
+                    runSyncInternal(force = false, onProgress = null)
+                } finally {
+                    isSyncing.set(false)
+                }
+            }
         }
-        if (isChallengePassThroughActive() && !force) return false
-        if (!isSyncing.compareAndSet(false, true)) return false
-        try {
-            val localVersion = currentSyncVersion()
-            val localTag = currentSyncTag()
-            var remoteTag: String? = null
-            var remoteVersion = 0L
-            var useManifestApi = false
-            var hitChallenge = false
-
-            // 1) Hafif sürüm kontrolü: kiosk-sync.php?since=<localVersion>
+        if (isSyncing.get() && onProgress != null) {
+            mainHandler.post { onProgress("Devam eden senkron bekleniyor...") }
+        }
+        return synchronized(syncLock) {
+            isSyncing.set(true)
             try {
-                val syncUrl = "https://$CANONICAL_HOST/kiosk-sync.php?since=$localVersion"
-                val req = buildBrowserRequest(syncUrl, "/kiosk-sync.php")
-                httpClient.newCall(req).execute().use { resp ->
-                    val rawBytes = resp.body?.bytes()
-                    if (resp.isSuccessful && rawBytes != null) {
-                        val body = rawBytes.toString(Charsets.UTF_8).trim()
-                        if (body.startsWith("{")) {
-                            val json = JSONObject(body)
-                            val ver = json.optLong("version", -1L)
-                            val assetsHash = json.optString("assets_hash", "").trim()
-                            val upd = json.optString("updated_at", "").trim()
-                            if (ver >= 0L) {
-                                useManifestApi = true
-                                remoteVersion = ver
-                                remoteTag = if (assetsHash.isNotEmpty()) "sync:$ver:$assetsHash" else "sync:$ver:$upd"
-                                KioskTlsHelper.simitcayVerifiedByOkHttp = true
-                                mainHandler.post { onConnectionStatusChanged(true) }
-                            }
-                        } else if (isSecurityChallengeHtml(rawBytes)) {
-                            hitChallenge = true
+                runSyncInternal(force = true, onProgress = onProgress)
+            } finally {
+                isSyncing.set(false)
+            }
+        }
+    }
+
+    private fun runSyncInternal(
+        force: Boolean,
+        onProgress: ((String) -> Unit)?
+    ): Boolean {
+        fun notifyProgress(msg: String) {
+            if (onProgress != null) {
+                mainHandler.post { onProgress(msg) }
+            }
+        }
+
+        if (force) {
+            lastWasSecurityChallenge = false
+            lastSyncBlockedByChallenge = false
+            notifyProgress("Sunucu kontrol ediliyor...")
+        }
+
+        val localVersion = currentSyncVersion()
+        val localTag = currentSyncTag()
+        var remoteTag: String? = null
+        var remoteVersion = 0L
+        var useManifestApi = false
+        var hitChallenge = false
+        var lastConnErr: String? = null
+
+        // 1) Hafif sürüm kontrolü: kiosk-sync.php?since=<localVersion>&_ts=...
+        try {
+            val syncUrl = "https://$CANONICAL_HOST/kiosk-sync.php?since=$localVersion&_ts=${System.currentTimeMillis()}"
+            val req = buildBrowserRequest(syncUrl, "/kiosk-sync.php")
+            httpClient.newCall(req).execute().use { resp ->
+                val rawBytes = resp.body?.bytes()
+                if (resp.isSuccessful && rawBytes != null) {
+                    val body = rawBytes.toString(Charsets.UTF_8).trim()
+                    if (body.startsWith("{")) {
+                        val json = JSONObject(body)
+                        val ver = json.optLong("version", -1L)
+                        val assetsHash = json.optString("assets_hash", "").trim()
+                        val upd = json.optString("updated_at", "").trim()
+                        if (ver >= 0L) {
+                            useManifestApi = true
+                            remoteVersion = ver
+                            remoteTag = if (assetsHash.isNotEmpty()) "sync:$ver:$assetsHash" else "sync:$ver:$upd"
+                            KioskTlsHelper.simitcayVerifiedByOkHttp = true
+                            mainHandler.post { onConnectionStatusChanged(true) }
                         }
-                    } else if (rawBytes != null && isSecurityChallengeHtml(rawBytes)) {
+                    } else if (isSecurityChallengeHtml(rawBytes)) {
+                        hitChallenge = true
+                    } else {
+                        lastConnErr = describeInvalidPayload("/kiosk-sync.php", rawBytes)
+                    }
+                } else if (rawBytes != null && isSecurityChallengeHtml(rawBytes)) {
+                    hitChallenge = true
+                } else {
+                    lastConnErr = "HTTP ${resp.code}"
+                }
+            }
+        } catch (e: Exception) {
+            lastConnErr = "Bağlantı hatası (${e.javaClass.simpleName})"
+            lastSyncStatus = lastConnErr!!
+        }
+
+        // 2) kiosk-sync.php erişilemezse yedek olarak api.php?action=menu revision kontrol et
+        if (!useManifestApi && !hitChallenge) {
+            try {
+                val apiCanonical = "https://$CANONICAL_HOST/api.php?action=menu"
+                val apiFetch = appendCacheBuster(apiCanonical)
+                val req = buildBrowserRequest(apiFetch, "/api.php")
+                httpClient.newCall(req).execute().use { resp ->
+                    val bytes = resp.body?.bytes()
+                    if (resp.isSuccessful && bytes != null && isValidPayload("/api.php", bytes)) {
+                        val body = bytes.toString(Charsets.UTF_8)
+                        val json = JSONObject(body)
+                        val rev = json.optLong("revision", -1L)
+                        if (rev >= 0L) {
+                            remoteTag = "rev:$rev"
+                        }
+                        save(canonicalKeyForUrl(apiCanonical), bytes, "application/json")
+                        KioskTlsHelper.simitcayVerifiedByOkHttp = true
+                        mainHandler.post { onConnectionStatusChanged(true) }
+                    } else if (bytes != null && isSecurityChallengeHtml(bytes)) {
                         hitChallenge = true
                     }
                 }
-            } catch (e: Exception) {
-                lastSyncStatus = "Bağlantı hatası (${e.javaClass.simpleName})"
+            } catch (_: Exception) {
             }
+        }
 
-            // 2) kiosk-sync.php erişilemezse yedek olarak api.php?action=menu revision kontrol et
-            if (!useManifestApi && !hitChallenge) {
-                try {
-                    val apiUrl = "https://$CANONICAL_HOST/api.php?action=menu"
-                    val req = buildBrowserRequest(apiUrl, "/api.php")
-                    httpClient.newCall(req).execute().use { resp ->
-                        val bytes = resp.body?.bytes()
-                        if (resp.isSuccessful && bytes != null && isValidPayload("/api.php", bytes)) {
-                            val body = bytes.toString(Charsets.UTF_8)
-                            val json = JSONObject(body)
-                            val rev = json.optLong("revision", -1L)
-                            if (rev >= 0L) {
-                                remoteTag = "rev:$rev"
-                            }
-                            save(hashKey(apiUrl), bytes, "application/json")
-                            KioskTlsHelper.simitcayVerifiedByOkHttp = true
-                            mainHandler.post { onConnectionStatusChanged(true) }
-                        } else if (bytes != null && isSecurityChallengeHtml(bytes)) {
-                            hitChallenge = true
-                        }
-                    }
-                } catch (_: Exception) {
-                }
-            }
+        if (hitChallenge) {
+            lastSyncBlockedByChallenge = true
+            lastSyncStatus = "Güvenlik doğrulaması gerekli (çerez yenilenecek)"
+            return false
+        }
 
-            if (hitChallenge) {
-                lastSyncBlockedByChallenge = true
-                lastSyncStatus = "Güvenlik doğrulaması gerekli (çerez yenilenecek)"
-                return false
-            }
+        if (useManifestApi || remoteTag != null) {
+            lastSyncBlockedByChallenge = false
+        }
 
-            if (useManifestApi || remoteTag != null) {
-                lastSyncBlockedByChallenge = false
-            }
-
-            val bundleComplete = hasCompleteOfflineBundle()
-            val imagesSyncedOnce = syncPrefs.getBoolean(KEY_IMAGES_SYNCED_ONCE, false)
-            val needsSync = force ||
-                !bundleComplete ||
-                (useManifestApi && !imagesSyncedOnce) ||
-                (remoteTag != null && remoteTag != localTag)
-            if (!needsSync) {
-                if (useManifestApi && remoteVersion > 0L) {
-                    lastSyncStatus = "Güncel (v$remoteVersion)"
-                }
-                return false
-            }
-
-            // 3A) kiosk-sync.php?mode=manifest ile hash bazlı çekirdek + ürün görseli senkronizasyonu
-            if (useManifestApi) {
-                val manifestUrl = "https://$CANONICAL_HOST/kiosk-sync.php?mode=manifest"
-                val (mRes, mErr) = fetchValidatedFromNetwork(manifestUrl, "/kiosk-sync.php", maxAttempts = 2)
-                if (mRes != null) {
-                    val manifestJson = JSONObject(mRes.first.toString(Charsets.UTF_8))
-                    val manifestVer = manifestJson.optLong("version", remoteVersion)
-                    val manifestHash = manifestJson.optString("assets_hash", "").trim()
-                    val finalTag = if (manifestHash.isNotEmpty()) "sync:$manifestVer:$manifestHash" else remoteTag
-
-                    var anyChanged = false
-                    var updatedCount = 0
-                    var allCoreOk = true
-                    val coreFiles = manifestJson.optJSONArray("core_files")
-                    if (coreFiles != null) {
-                        for (i in 0 until coreFiles.length()) {
-                            val item = coreFiles.optJSONObject(i) ?: continue
-                            val url = item.optString("url", "").trim()
-                            val remoteHash = item.optString("hash", "").trim()
-                            if (url.isEmpty() || url.contains("analytics.js")) continue
-                            val key = hashKey(url)
-                            val hashPrefKey = "h_$key"
-                            val storedHash = syncPrefs.getString(hashPrefKey, "") ?: ""
-                            val validOnDisk = hasValidCachedFile(url)
-                            if (force || remoteHash.isEmpty() || storedHash != remoteHash || !validOnDisk) {
-                                val res = downloadAndCacheUrl(url, saveAsFallback = true)
-                                if (res != null) {
-                                    anyChanged = true
-                                    updatedCount++
-                                    if (remoteHash.isNotEmpty()) {
-                                        syncPrefs.edit().putString(hashPrefKey, remoteHash).apply()
-                                    }
-                                } else {
-                                    val low = url.lowercase()
-                                    if (low.endsWith("tablet.html") || low.contains("menu-data.php") || low.endsWith("menu-ui.js") || low.endsWith("tablet.js") || low.endsWith("tablet.css")) {
-                                        allCoreOk = false
-                                    }
-                                }
-                                try {
-                                    Thread.sleep(40)
-                                } catch (_: InterruptedException) {
-                                    break
-                                }
-                            }
-                        }
-                    }
-
-                    val imagesArr = manifestJson.optJSONArray("images")
-                    val activeImgKeys = mutableSetOf<String>()
-                    var failedImages = 0
-                    if (imagesArr != null) {
-                        for (i in 0 until imagesArr.length()) {
-                            val item = imagesArr.optJSONObject(i) ?: continue
-                            val url = item.optString("url", "").trim()
-                            val remoteHash = item.optString("hash", "").trim()
-                            if (url.isEmpty()) continue
-                            val key = hashKey(url)
-                            activeImgKeys.add(key)
-                            val hashPrefKey = "h_$key"
-                            val storedHash = syncPrefs.getString(hashPrefKey, "") ?: ""
-                            val imgFile = File(cacheDir, "$key.bin")
-                            val exists = imgFile.exists() && imgFile.length() >= 64L
-                            if (remoteHash.isEmpty() || storedHash != remoteHash || !exists) {
-                                val res = downloadAndCacheUrl(url, saveAsFallback = false)
-                                if (res != null) {
-                                    anyChanged = true
-                                    updatedCount++
-                                    if (remoteHash.isNotEmpty()) {
-                                        syncPrefs.edit().putString(hashPrefKey, remoteHash).apply()
-                                    }
-                                } else {
-                                    failedImages++
-                                }
-                                try {
-                                    Thread.sleep(60)
-                                } catch (_: InterruptedException) {
-                                    break
-                                }
-                            }
-                        }
-                        val prevKeys = syncPrefs.getStringSet(KEY_MANIFEST_IMG_KEYS, emptySet()) ?: emptySet()
-                        val staleKeys = prevKeys - activeImgKeys
-                        if (staleKeys.isNotEmpty()) {
-                            val cleanEd = syncPrefs.edit()
-                            staleKeys.forEach { oldKey ->
-                                try {
-                                    File(cacheDir, "$oldKey.bin").delete()
-                                    File(cacheDir, "$oldKey.mime").delete()
-                                    cleanEd.remove("h_$oldKey")
-                                } catch (_: Exception) {
-                                }
-                            }
-                            cleanEd.apply()
-                        }
-                        syncPrefs.edit().putStringSet(KEY_MANIFEST_IMG_KEYS, HashSet(activeImgKeys)).apply()
-                    }
-
-                    // Canlı api.php?action=menu önbelleğini de tazele (refreshBoard eski JSON görmesin)
-                    if (anyChanged || force) {
-                        downloadAndCacheUrl("https://$CANONICAL_HOST/api.php?action=menu", saveAsFallback = true)
-                    }
-
-                    if (allCoreOk && hasCompleteOfflineBundle()) {
-                        lastSubresourceError = null
-                        lastSyncBlockedByChallenge = false
-                        val ed = syncPrefs.edit()
-                        if (manifestVer > 0L) ed.putLong(KEY_SYNC_VERSION, manifestVer)
-                        if (failedImages == 0) {
-                            ed.putBoolean(KEY_IMAGES_SYNCED_ONCE, true)
-                            if (finalTag != null) ed.putString(KEY_SYNC_TAG, finalTag)
-                            lastSyncStatus = if (updatedCount > 0) "Güncellendi (v$manifestVer • $updatedCount dosya)" else "Güncel (v$manifestVer)"
-                        } else {
-                            lastSyncStatus = "v$manifestVer indirildi ($failedImages görsel tekrar denenecek)"
-                        }
-                        ed.apply()
-                        return anyChanged || force
-                    }
-                    lastSyncStatus = "Çekirdek dosya eksik (tekrar denenecek)"
-                    return false
-                } else {
-                    if (lastWasSecurityChallenge) {
-                        lastSyncBlockedByChallenge = true
-                        lastSyncStatus = "Güvenlik doğrulaması gerekli (manifest)"
-                    } else {
-                        lastSyncStatus = "Manifest alınamadı (${mErr ?: "hata"})"
-                    }
-                    return false
-                }
-            }
-
-            // 3B) Yedek senkronizasyon: tablet.html içindeki script/css adreslerini doğrudan çek
-            val htmlBytes = downloadAndCacheUrl("https://$CANONICAL_HOST/tablet.html", saveAsFallback = true)
-                ?: run {
-                    if (lastWasSecurityChallenge) {
-                        lastSyncBlockedByChallenge = true
-                        lastSyncStatus = "Güvenlik doğrulaması gerekli (çerez yenilenecek)"
-                    }
-                    return false
-                }
-            val html = htmlBytes.toString(Charsets.UTF_8)
-
-            val urlsToSync = linkedSetOf(
-                "https://$CANONICAL_HOST/tablet.css",
-                "https://$CANONICAL_HOST/menu-data.php?v=lang-1",
-                "https://$CANONICAL_HOST/menu-ui.js",
-                "https://$CANONICAL_HOST/tablet.js",
-                "https://$CANONICAL_HOST/logo-client.js",
-                "https://$CANONICAL_HOST/waiter-button.js",
-                "https://$CANONICAL_HOST/site-logo.php"
-            )
-            val assetRegex = Regex("(?:src|href)=\"([^\"]+\\.(?:js|css|php)(?:\\?[^\"]*)?)\"")
-            assetRegex.findAll(html).forEach { m ->
-                val raw = m.groupValues.getOrNull(1)?.trim() ?: ""
-                if (raw.isNotEmpty() && !raw.startsWith("http://") && !raw.startsWith("https://") && !raw.startsWith("//") && !raw.contains("analytics.js")) {
-                    urlsToSync.add("https://$CANONICAL_HOST/${raw.removePrefix("/")}")
-                }
-            }
-
-            var allCoreOk = true
-            for (assetUrl in urlsToSync) {
-                val res = downloadAndCacheUrl(assetUrl, saveAsFallback = true)
-                val low = assetUrl.lowercase()
-                if (res == null && (low.contains("menu-data.php") || low.contains("menu-ui.js") || low.contains("tablet.js") || low.contains("tablet.css"))) {
-                    allCoreOk = false
-                }
-            }
-
-            if (allCoreOk && hasCompleteOfflineBundle()) {
-                lastSubresourceError = null
-                lastSyncBlockedByChallenge = false
-                if (remoteTag != null) {
-                    syncPrefs.edit().putString(KEY_SYNC_TAG, remoteTag).apply()
-                }
-                lastSyncStatus = "Yedek senkron tamamlandı"
-                return true
+        val bundleComplete = hasCompleteOfflineBundle()
+        val imagesSyncedOnce = syncPrefs.getBoolean(KEY_IMAGES_SYNCED_ONCE, false)
+        val needsSync = force ||
+            !bundleComplete ||
+            (useManifestApi && !imagesSyncedOnce) ||
+            (remoteTag != null && remoteTag != localTag)
+        if (!needsSync) {
+            if (useManifestApi && remoteVersion > 0L) {
+                lastSyncStatus = "Güncel (v$remoteVersion)"
             }
             return false
-        } finally {
-            isSyncing.set(false)
         }
+
+        // 3A) kiosk-sync.php?mode=manifest ile hash bazlı çekirdek + ürün görseli senkronizasyonu
+        if (useManifestApi) {
+            notifyProgress("Menü listesi indiriliyor...")
+            val manifestUrl = "https://$CANONICAL_HOST/kiosk-sync.php?mode=manifest&_ts=${System.currentTimeMillis()}"
+            val (mRes, mErr) = fetchValidatedFromNetwork(manifestUrl, "/kiosk-sync.php", maxAttempts = 2)
+            if (mRes != null) {
+                val manifestJson = JSONObject(mRes.first.toString(Charsets.UTF_8))
+                val manifestVer = manifestJson.optLong("version", remoteVersion)
+                val manifestHash = manifestJson.optString("assets_hash", "").trim()
+                val finalTag = if (manifestHash.isNotEmpty()) "sync:$manifestVer:$manifestHash" else remoteTag
+
+                var anyChanged = false
+                var updatedCount = 0
+                var allCoreOk = true
+                val coreFiles = manifestJson.optJSONArray("core_files")
+                val coreItems = mutableListOf<Pair<String, String>>()
+                if (coreFiles != null) {
+                    for (i in 0 until coreFiles.length()) {
+                        val item = coreFiles.optJSONObject(i) ?: continue
+                        val url = item.optString("url", "").trim()
+                        val remoteHash = item.optString("hash", "").trim()
+                        if (url.isNotEmpty() && !url.contains("analytics.js")) {
+                            coreItems.add(url to remoteHash)
+                        }
+                    }
+                }
+                for (idx in coreItems.indices) {
+                    val (url, remoteHash) = coreItems[idx]
+                    val key = canonicalKeyForUrl(url)
+                    val hashPrefKey = "h_$key"
+                    val storedHash = syncPrefs.getString(hashPrefKey, "") ?: ""
+                    val validOnDisk = hasValidCachedFile(url)
+                    if (force || remoteHash.isEmpty() || storedHash != remoteHash || !validOnDisk) {
+                        notifyProgress("Menü dosyaları indiriliyor (${idx + 1}/${coreItems.size})...")
+                        lastWasSecurityChallenge = false
+                        val res = downloadAndCacheUrl(url, cacheBust = force)
+                        if (res != null) {
+                            anyChanged = true
+                            updatedCount++
+                            if (remoteHash.isNotEmpty()) {
+                                syncPrefs.edit().putString(hashPrefKey, remoteHash).apply()
+                            }
+                        } else {
+                            if (lastWasSecurityChallenge) {
+                                lastSyncBlockedByChallenge = true
+                                lastSyncStatus = "Güvenlik doğrulaması gerekli (dosya)"
+                                return false
+                            }
+                            val low = url.lowercase()
+                            if (low.endsWith("tablet.html") || low.contains("menu-data.php") || low.endsWith("menu-ui.js") || low.endsWith("tablet.js") || low.endsWith("tablet.css")) {
+                                allCoreOk = false
+                            }
+                        }
+                        try {
+                            Thread.sleep(30)
+                        } catch (_: InterruptedException) {
+                            break
+                        }
+                    }
+                }
+
+                val imagesArr = manifestJson.optJSONArray("images")
+                val activeImgKeys = mutableSetOf<String>()
+                var failedImages = 0
+                var downloadedImages = 0
+                if (imagesArr != null) {
+                    notifyProgress("Ürün görselleri kontrol ediliyor...")
+                    for (i in 0 until imagesArr.length()) {
+                        val item = imagesArr.optJSONObject(i) ?: continue
+                        val url = item.optString("url", "").trim()
+                        val remoteHash = item.optString("hash", "").trim()
+                        if (url.isEmpty()) continue
+                        val key = canonicalKeyForUrl(url)
+                        activeImgKeys.add(key)
+                        val hashPrefKey = "h_$key"
+                        val storedHash = syncPrefs.getString(hashPrefKey, "") ?: ""
+                        val imgFile = File(cacheDir, "$key.bin")
+                        val exists = imgFile.exists() && imgFile.length() >= 64L
+                        if (remoteHash.isEmpty() || storedHash != remoteHash || !exists) {
+                            lastWasSecurityChallenge = false
+                            val res = downloadAndCacheUrl(url, cacheBust = force)
+                            if (res != null) {
+                                anyChanged = true
+                                updatedCount++
+                                downloadedImages++
+                                notifyProgress("Görseller indiriliyor ($downloadedImages)...")
+                                if (remoteHash.isNotEmpty()) {
+                                    syncPrefs.edit().putString(hashPrefKey, remoteHash).apply()
+                                }
+                            } else {
+                                if (lastWasSecurityChallenge) {
+                                    lastSyncBlockedByChallenge = true
+                                    lastSyncStatus = "Güvenlik doğrulaması gerekli (görsel)"
+                                    return false
+                                }
+                                failedImages++
+                            }
+                            try {
+                                Thread.sleep(45)
+                            } catch (_: InterruptedException) {
+                                break
+                            }
+                        }
+                    }
+                    val prevKeys = syncPrefs.getStringSet(KEY_MANIFEST_IMG_KEYS, emptySet()) ?: emptySet()
+                    val staleKeys = prevKeys - activeImgKeys
+                    if (staleKeys.isNotEmpty()) {
+                        val cleanEd = syncPrefs.edit()
+                        staleKeys.forEach { oldKey ->
+                            try {
+                                File(cacheDir, "$oldKey.bin").delete()
+                                File(cacheDir, "$oldKey.mime").delete()
+                                cleanEd.remove("h_$oldKey")
+                            } catch (_: Exception) {
+                            }
+                        }
+                        cleanEd.apply()
+                    }
+                    syncPrefs.edit().putStringSet(KEY_MANIFEST_IMG_KEYS, HashSet(activeImgKeys)).apply()
+                }
+
+                // Canlı api.php?action=menu önbelleğini de tazele (refreshBoard eski JSON görmesin)
+                if (anyChanged || force) {
+                    notifyProgress("Canlı menü verisi güncelleniyor...")
+                    downloadAndCacheUrl("https://$CANONICAL_HOST/api.php?action=menu", cacheBust = force)
+                }
+
+                if (allCoreOk && hasCompleteOfflineBundle()) {
+                    lastSubresourceError = null
+                    lastSyncBlockedByChallenge = false
+                    val ed = syncPrefs.edit()
+                    if (manifestVer > 0L) ed.putLong(KEY_SYNC_VERSION, manifestVer)
+                    if (failedImages == 0) {
+                        ed.putBoolean(KEY_IMAGES_SYNCED_ONCE, true)
+                        if (finalTag != null) ed.putString(KEY_SYNC_TAG, finalTag)
+                        lastSyncStatus = if (updatedCount > 0) "v$manifestVer • $updatedCount dosya güncellendi" else "Güncel (v$manifestVer)"
+                    } else {
+                        lastSyncStatus = "v$manifestVer indirildi ($failedImages görsel tekrar denenecek)"
+                    }
+                    ed.apply()
+                    return anyChanged || force
+                }
+                lastSyncStatus = "Çekirdek dosya eksik (${lastSubresourceError ?: "tekrar denenecek"})"
+                return false
+            } else {
+                if (lastWasSecurityChallenge) {
+                    lastSyncBlockedByChallenge = true
+                    lastSyncStatus = "Güvenlik doğrulaması gerekli (manifest)"
+                } else {
+                    lastSyncStatus = "Manifest alınamadı (${mErr ?: "hata"})"
+                }
+                return false
+            }
+        }
+
+        // 3B) Yedek senkronizasyon: tablet.html içindeki script/css adreslerini doğrudan çek
+        notifyProgress("Menü dosyaları doğrudan indiriliyor...")
+        lastWasSecurityChallenge = false
+        val htmlBytes = downloadAndCacheUrl("https://$CANONICAL_HOST/tablet.html", cacheBust = force)
+            ?: run {
+                if (lastWasSecurityChallenge) {
+                    lastSyncBlockedByChallenge = true
+                    lastSyncStatus = "Güvenlik doğrulaması gerekli (çerez yenilenecek)"
+                } else {
+                    lastSyncStatus = lastSubresourceError ?: lastConnErr ?: "Sunucuya erişilemedi"
+                }
+                return false
+            }
+        val html = htmlBytes.toString(Charsets.UTF_8)
+
+        val urlsToSync = linkedSetOf(
+            "https://$CANONICAL_HOST/tablet.css",
+            "https://$CANONICAL_HOST/menu-data.php?v=lang-1",
+            "https://$CANONICAL_HOST/menu-ui.js",
+            "https://$CANONICAL_HOST/tablet.js",
+            "https://$CANONICAL_HOST/logo-client.js",
+            "https://$CANONICAL_HOST/waiter-button.js",
+            "https://$CANONICAL_HOST/site-logo.php",
+            "https://$CANONICAL_HOST/api.php?action=menu"
+        )
+        val assetRegex = Regex("(?:src|href)=\"([^\"]+\\.(?:js|css|php)(?:\\?[^\"]*)?)\"")
+        assetRegex.findAll(html).forEach { m ->
+            val raw = m.groupValues.getOrNull(1)?.trim() ?: ""
+            if (raw.isNotEmpty() && !raw.startsWith("http://") && !raw.startsWith("https://") && !raw.startsWith("//") && !raw.contains("analytics.js")) {
+                urlsToSync.add("https://$CANONICAL_HOST/${raw.removePrefix("/")}")
+            }
+        }
+
+        var allCoreOk = true
+        val urlList = urlsToSync.toList()
+        for (idx in urlList.indices) {
+            val assetUrl = urlList[idx]
+            notifyProgress("Dosyalar indiriliyor (${idx + 1}/${urlList.size})...")
+            val res = downloadAndCacheUrl(assetUrl, cacheBust = force)
+            val low = assetUrl.lowercase()
+            if (res == null && (low.contains("menu-data.php") || low.contains("menu-ui.js") || low.contains("tablet.js") || low.contains("tablet.css"))) {
+                allCoreOk = false
+            }
+        }
+
+        if (allCoreOk && hasCompleteOfflineBundle()) {
+            lastSubresourceError = null
+            lastSyncBlockedByChallenge = false
+            if (remoteTag != null) {
+                syncPrefs.edit().putString(KEY_SYNC_TAG, remoteTag).apply()
+            }
+            lastSyncStatus = "Yedek senkron tamamlandı"
+            return true
+        }
+        lastSyncStatus = "Yedek senkron başarısız (${lastSubresourceError ?: "dosya eksik"})"
+        return false
     }
 
     fun fetchOrServeCached(request: WebResourceRequest): WebResourceResponse? {
@@ -1258,10 +1345,8 @@ private class OfflineMenuCache(
         val host = uri.host?.lowercase() ?: ""
         val fullUrl = uri.toString()
         val path = uri.path?.lowercase() ?: ""
-        val fallbackUrl = canonicalFallbackUrl(uri)
-        val exactKey = hashKey(fullUrl)
-        val fallbackKey = hashKey(fallbackUrl)
         val isFontHost = host == "fonts.googleapis.com" || host == "fonts.gstatic.com"
+        val cacheKey = if (isFontHost) hashKey(fullUrl) else hashKey(canonicalFallbackUrl(uri))
         val isLiveApi = path.contains("api.php")
         val isCoreAsset = !isFontHost && (
             request.isForMainFrame ||
@@ -1271,7 +1356,7 @@ private class OfflineMenuCache(
             path.endsWith("tablet.js") ||
             path.endsWith("tablet.css")
         )
-        val cachedBefore = load(exactKey, path) ?: load(fallbackKey, path)
+        val cachedBefore = load(cacheKey, path)
         val onlineNow = isNetworkAvailable(appContext)
 
         // Google Fonts her zaman önbellek öncelikli; erişilemezse sayfa çizimini asla kilitlemez.
@@ -1286,7 +1371,7 @@ private class OfflineMenuCache(
                             if (bytes != null && bytes.isNotEmpty()) {
                                 val mime = resp.header("Content-Type")?.substringBefore(";")?.trim()
                                     ?.takeIf { it.isNotBlank() } ?: guessMimeType(uri)
-                                save(exactKey, bytes, mime)
+                                save(cacheKey, bytes, mime)
                                 return buildResponse(bytes, mime, path)
                             }
                         }
@@ -1299,7 +1384,7 @@ private class OfflineMenuCache(
         }
 
         // CACHE-FIRST: Çekirdek paket tamsa ve bu canlı api.php isteği değilse önbellekten ANINDA (0 ms) sun.
-        // Güncellemeler arka plandaki senkronizasyon döngüsü tarafından sessizce indirilir.
+        // Güncellemeler arka plandaki senkronizasyon döngüsü veya yönetici güncelleme butonu ile kanonik anahtara yazılır.
         if (!isLiveApi && cachedBefore != null && (!request.isForMainFrame || hasCompleteOfflineBundle())) {
             if (request.isForMainFrame) {
                 lastMainFrameLoaded = true
@@ -1321,10 +1406,7 @@ private class OfflineMenuCache(
                     lastMainFrameLoaded = true
                     lastSubresourceError = null
                 }
-                save(exactKey, bytes, mime)
-                if (isCoreAsset || isLiveApi || path.endsWith(".js") || path.endsWith(".css") || path.contains("site-logo.php")) {
-                    save(fallbackKey, bytes, mime)
-                }
+                save(cacheKey, bytes, mime)
                 if (isCoreAsset || isLiveApi) {
                     mainHandler.post { onConnectionStatusChanged(true) }
                 }
@@ -1542,6 +1624,8 @@ fun KioskScreen(
     var screenTimeoutSec by remember { mutableStateOf(initialScreenTimeoutSec) }
     var lastLoadedUrl by remember { mutableStateOf(currentUrl) }
     var cachedCount by remember { mutableStateOf(0) }
+    var syncVersionNum by remember { mutableStateOf(0L) }
+    var syncStatusText by remember { mutableStateOf("Kontrol bekleniyor") }
     var batteryPercent by remember { mutableStateOf(-1) }
     var isCharging by remember { mutableStateOf(false) }
     var isChallengeMode by remember { mutableStateOf(false) }
@@ -1593,6 +1677,8 @@ fun KioskScreen(
 
     LaunchedEffect(Unit) {
         cachedCount = offlineCache.cachedFileCount()
+        syncVersionNum = offlineCache.currentSyncVersion()
+        syncStatusText = offlineCache.lastSyncStatus
         // Tabletlerin aynı anda sunucuya yüklenmesini önlemek için rastgele gecikme (jitter)
         val initialDelayMs = if (offlineCache.hasCompleteOfflineBundle()) {
             Random.nextLong(5_000L, 15_000L)
@@ -1609,11 +1695,13 @@ fun KioskScreen(
                 }
             }
             cachedCount = offlineCache.cachedFileCount()
+            syncVersionNum = offlineCache.currentSyncVersion()
+            syncStatusText = offlineCache.lastSyncStatus
             if (updated) {
                 if (latestShowInitialError || !latestHasLoadedOnce || latestIsScreenSleeping || latestScreenTimeoutSec == 0) {
                     showInitialError = false
                     pendingBackgroundReload = false
-                    webViewRef?.clearCache(false)
+                    webViewRef?.clearCache(true)
                     webViewRef?.loadUrl(targetUrl)
                 } else {
                     // Müşteri ekrana bakarken ürün/fiyat verisini kesintisiz tazele, tam yenilemeyi sıraya al
@@ -1623,7 +1711,7 @@ fun KioskScreen(
             } else if (offlineCache.lastSyncBlockedByChallenge && latestIsScreenSleeping && !offlineCache.isChallengePassThroughActive()) {
                 // Süresi dolmuş güvenlik çerezini tablet uykudayken sessizce yenile
                 offlineCache.activateChallengePassThrough(180_000L)
-                webViewRef?.clearCache(false)
+                webViewRef?.clearCache(true)
                 webViewRef?.loadUrl(targetUrl)
             }
             delay(60_000L + Random.nextLong(0L, 25_000L))
@@ -1634,11 +1722,11 @@ fun KioskScreen(
     LaunchedEffect(isScreenSleeping, pendingBackgroundReload) {
         if (isScreenSleeping && pendingBackgroundReload) {
             pendingBackgroundReload = false
-            webViewRef?.clearCache(false)
+            webViewRef?.clearCache(true)
             webViewRef?.loadUrl(targetUrl)
         } else if (isScreenSleeping && offlineCache.lastSyncBlockedByChallenge && !offlineCache.isChallengePassThroughActive()) {
             offlineCache.activateChallengePassThrough(180_000L)
-            webViewRef?.clearCache(false)
+            webViewRef?.clearCache(true)
             webViewRef?.loadUrl(targetUrl)
         }
     }
@@ -1649,7 +1737,7 @@ fun KioskScreen(
             delay(90_000L)
             if (pendingBackgroundReload) {
                 pendingBackgroundReload = false
-                webViewRef?.clearCache(false)
+                webViewRef?.clearCache(true)
                 webViewRef?.loadUrl(targetUrl)
             }
         }
@@ -1720,7 +1808,7 @@ fun KioskScreen(
                         if (!hasLoadedOnce) {
                             webViewRef?.loadUrl(targetUrl)
                         } else {
-                            webViewRef?.clearCache(false)
+                            webViewRef?.clearCache(true)
                             webViewRef?.reload()
                         }
                     }
@@ -1899,7 +1987,10 @@ fun KioskScreen(
                                                         offlineCache.syncInBackgroundIfNeeded(force = true)
                                                     }
                                                     cachedCount = offlineCache.cachedFileCount()
+                                                    syncVersionNum = offlineCache.currentSyncVersion()
+                                                    syncStatusText = offlineCache.lastSyncStatus
                                                     if (clean == "MENU_NEED_POLYFILL" && (synced || offlineCache.hasCompleteOfflineBundle())) {
+                                                        view.clearCache(true)
                                                         view.loadUrl(targetUrl)
                                                     }
                                                 }
@@ -1933,8 +2024,11 @@ fun KioskScreen(
                                                             offlineCache.syncInBackgroundIfNeeded(force = true)
                                                         }
                                                         cachedCount = offlineCache.cachedFileCount()
+                                                        syncVersionNum = offlineCache.currentSyncVersion()
+                                                        syncStatusText = offlineCache.lastSyncStatus
                                                         if (fixed) {
                                                             showInitialError = false
+                                                            view.clearCache(true)
                                                             view.loadUrl(targetUrl)
                                                         } else {
                                                             val detail = listOf(flags, jsErr, subErr).filter { it.isNotBlank() }.joinToString(" • ").ifBlank { "Menü scripti yüklenemedi" }
@@ -2088,6 +2182,8 @@ fun KioskScreen(
                     detectTapGestures(
                         onLongPress = {
                             cachedCount = offlineCache.cachedFileCount()
+                            syncVersionNum = offlineCache.currentSyncVersion()
+                            syncStatusText = offlineCache.lastSyncStatus
                             showAdminDialog = true
                         }
                     )
@@ -2119,8 +2215,8 @@ fun KioskScreen(
                 batteryPercent = batteryPercent,
                 isCharging = isCharging,
                 cachedCount = cachedCount,
-                syncVersion = offlineCache.currentSyncVersion(),
-                syncStatus = offlineCache.lastSyncStatus,
+                syncVersion = syncVersionNum,
+                syncStatus = syncStatusText,
                 appVersion = appVersionLabel,
                 isDeviceOwner = isDeviceOwner,
                 onDismiss = {
@@ -2140,19 +2236,58 @@ fun KioskScreen(
                     onSaveScreenTimeoutSec(sec)
                 },
                 onSavePin = { onSavePin(it) },
+                onForceMenuUpdate = { onProgress, onComplete ->
+                    kioskScope.launch {
+                        onProgress("Sunucu kontrol ediliyor...")
+                        val ok = withContext(Dispatchers.IO) {
+                            try {
+                                offlineCache.syncInBackgroundIfNeeded(
+                                    force = true,
+                                    onProgress = onProgress
+                                )
+                            } catch (e: Exception) {
+                                false
+                            }
+                        }
+                        cachedCount = offlineCache.cachedFileCount()
+                        syncVersionNum = offlineCache.currentSyncVersion()
+                        syncStatusText = offlineCache.lastSyncStatus
+                        val blocked = offlineCache.lastSyncBlockedByChallenge
+                        if (blocked) {
+                            offlineCache.activateChallengePassThrough(180_000L)
+                            pendingBackgroundReload = false
+                            showInitialError = false
+                            webViewRef?.clearCache(true)
+                            webViewRef?.loadUrl(targetUrl)
+                            onComplete(false, "Güvenlik doğrulaması açılıyor...", true)
+                            showAdminDialog = false
+                        } else if (ok) {
+                            showInitialError = false
+                            pendingBackgroundReload = false
+                            emptyAutoRepairTried = false
+                            webViewRef?.clearCache(true)
+                            webViewRef?.loadUrl(targetUrl)
+                            onComplete(true, offlineCache.lastSyncStatus, false)
+                        } else {
+                            onComplete(false, offlineCache.lastSyncStatus, false)
+                        }
+                    }
+                },
                 onReload = {
                     kioskScope.launch {
                         withContext(Dispatchers.IO) {
                             offlineCache.syncInBackgroundIfNeeded(force = true)
                         }
                         cachedCount = offlineCache.cachedFileCount()
+                        syncVersionNum = offlineCache.currentSyncVersion()
+                        syncStatusText = offlineCache.lastSyncStatus
                         showInitialError = false
                         pendingBackgroundReload = false
                         if (offlineCache.lastSyncBlockedByChallenge) {
                             offlineCache.activateChallengePassThrough(180_000L)
                             showAdminDialog = false
                         }
-                        webViewRef?.clearCache(false)
+                        webViewRef?.clearCache(true)
                         webViewRef?.loadUrl(targetUrl)
                     }
                 },
@@ -2160,6 +2295,8 @@ fun KioskScreen(
                     offlineCache.clearCache()
                     offlineCache.clearChallengePassThrough()
                     cachedCount = 0
+                    syncVersionNum = 0L
+                    syncStatusText = "Önbellek temizlendi"
                     emptyAutoRepairTried = false
                     showInitialError = false
                     pendingBackgroundReload = false
@@ -2390,6 +2527,10 @@ fun HardenedAdminDialog(
     onSaveUpdateUrl: (String) -> String,
     onSaveScreenTimeoutSec: (Int) -> Unit,
     onSavePin: (String) -> Unit,
+    onForceMenuUpdate: (
+        onProgress: (String) -> Unit,
+        onComplete: (Boolean, String, Boolean) -> Unit
+    ) -> Unit,
     onReload: () -> Unit,
     onClearCacheAndReload: () -> Unit,
     onLockKiosk: () -> Unit,
@@ -2404,6 +2545,9 @@ fun HardenedAdminDialog(
     var updateUrlInput by remember { mutableStateOf(currentUpdateUrl) }
     var timeoutSecInput by remember { mutableStateOf(currentScreenTimeoutSec) }
     var newPinInput by remember { mutableStateOf("") }
+    var isUpdatingMenu by remember { mutableStateOf(false) }
+    var menuUpdateStatus by remember { mutableStateOf<String?>(null) }
+    var menuUpdateIsError by remember { mutableStateOf(false) }
     var isUpdatingApk by remember { mutableStateOf(false) }
     var updateStatus by remember { mutableStateOf<String?>(null) }
 
@@ -2469,6 +2613,56 @@ fun HardenedAdminDialog(
                         fontSize = 11.sp,
                         color = Color.Gray
                     )
+
+                    Button(
+                        onClick = {
+                            if (isUpdatingMenu) return@Button
+                            isUpdatingMenu = true
+                            menuUpdateIsError = false
+                            menuUpdateStatus = "Menü sunucudan çekiliyor..."
+                            onForceMenuUpdate(
+                                { progressMsg ->
+                                    menuUpdateStatus = progressMsg
+                                },
+                                { success, msg, needsChallenge ->
+                                    isUpdatingMenu = false
+                                    menuUpdateIsError = !success && !needsChallenge
+                                    menuUpdateStatus = if (success) {
+                                        "Menü güncellendi ve ekrana uygulandı! ($msg)"
+                                    } else {
+                                        msg
+                                    }
+                                    if (success) {
+                                        scope.launch {
+                                            delay(1200L)
+                                            onDismiss()
+                                        }
+                                    }
+                                }
+                            )
+                        },
+                        enabled = !isUpdatingMenu && !isUpdatingApk,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = if (isUpdatingMenu) "Menü Güncelleniyor..." else "Menüyü Güncelle (Şimdi Çek)",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    if (!menuUpdateStatus.isNullOrBlank()) {
+                        Text(
+                            text = menuUpdateStatus!!,
+                            fontSize = 11.sp,
+                            color = when {
+                                isUpdatingMenu -> Color(0xFF0369A1)
+                                menuUpdateIsError -> Color(0xFFDC2626)
+                                else -> Color(0xFF15803D)
+                            },
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
 
                     Text(
                         text = "Hareketsizlik Ekran Uyku Süresi:",
